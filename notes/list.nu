@@ -53,7 +53,7 @@ def main [
 
         mut file_entry = $"=== ($rel) \(($count) lines\) ==="
         if not ($headings | is-empty) {
-            $file_entry = ($file_entry + "\n" + ($headings | slice 0..12 | str join "\n"))
+            $file_entry = ($file_entry + "\n" + ($headings | str join "\n"))
         }
         $output = ($output | append $file_entry)
     }

@@ -23,12 +23,14 @@ def main [
         }
     }
 
+    let note_content = (open --raw $target_file)
+    let note_lines = ($note_content | lines | length)
+    let note_sz = ($note_content | str length | into filesize)
+
     if ("/dev/tty" | path exists) {
         let base = ($target_file | path basename)
-        $"\n[notes/inspect] note: ($base) | question: ($question | str substring 0..40)...\n" | save --append "/dev/tty"
+        $"\e[2m[inspecting]\e[0m ($base) \(($note_lines) lines, ($note_sz)\) | query: ($question)\n" | save --append "/dev/tty"
     }
-
-    let note_content = (open --raw $target_file)
 
     let prompt = $"You are an academic extraction assistant for university student notes.
 Note Document: ($target_file | path basename)

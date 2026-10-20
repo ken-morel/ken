@@ -23,8 +23,8 @@ def get_session_dir [] {
     $d
 }
 
-def get_slots_dir [] {
-    let d = ($env.HOME | path join ".cache" "qwen-server" "slots")
+def get_slots_dir [model: string = "qwen"] {
+    let d = ($env.HOME | path join ".cache" $"($model)-server" "slots")
     mkdir $d
     $d
 }
@@ -32,6 +32,8 @@ def get_slots_dir [] {
 def tty_report [msg: string] {
     if ("/dev/tty" | path exists) {
         $msg | save --append "/dev/tty"
+    } else {
+        print -e -n $msg
     }
 }
 
@@ -40,14 +42,18 @@ def parse_spec [spec_str: string] {
     let raw = ($spec_str | default "")
     
     # Try: (digits)?(agent.)?(model)
-    let p1 = ($raw | parse -r '^(?:(?<session>\d+))?(?:(?<agent>[a-zA-Z0-9_-]+)\.)?(?<model>qwent|qwen|lfm)$')
+    let p1 = ($raw | parse -r '^(?:(?<session>\d+))?(?:(?<agent>[a-zA-Z0-9_-]+)\.)?(?<model>qwent|qwen|lfm|dskt|dsk)$')
     if not ($p1 | is-empty) {
         let row = ($p1 | first)
         let s = (if ($row.session | is-empty) { null } else { $row.session })
         let a = (if ($row.agent | is-empty) { "orchestrator" } else { $row.agent })
         let m_spec = $row.model
-        let is_thinking = ($m_spec == "qwent")
-        let m = (if $m_spec in ["qwent" "qwen"] { "qwen" } else { "lfm" })
+        let is_thinking = ($m_spec in ["qwent" "dskt"])
+        let m = match $m_spec {
+            "lfm" => "lfm"
+            "dsk" | "dskt" => "dsk"
+            _ => "qwen"
+        }
         return { session: $s, agent: $a, model: $m, thinking: $is_thinking }
     }
 
@@ -57,9 +63,13 @@ def parse_spec [spec_str: string] {
         let row = ($p2 | first)
         let s = (if ($row.session | is-empty) { null } else { $row.session })
         let a = $row.agent
-        if $a in ["qwen" "qwent" "lfm"] {
-            let is_thinking = ($a == "qwent")
-            let m = (if $a in ["qwent" "qwen"] { "qwen" } else { "lfm" })
+        if $a in ["qwen" "qwent" "lfm" "dsk" "dskt"] {
+            let is_thinking = ($a in ["qwent" "dskt"])
+            let m = match $a {
+                "lfm" => "lfm"
+                "dsk" | "dskt" => "dsk"
+                _ => "qwen"
+            }
             return { session: $s, agent: "orchestrator", model: $m, thinking: $is_thinking }
         }
         return { session: $s, agent: $a, model: "qwen", thinking: false }
@@ -160,13 +170,30 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
         }
     }
 
-    tty_report ("\n[call] tool: " + $fn_name + " | args: " + $args_json + "\n")
+    # Format detailed tool command line
+    let agent_name = ($agent_dir | path basename)
+    let formatted_args = ($args_dict | transpose key val | each { |it|
+        $"--($it.key) '($it.val)'"
+    } | str join " ")
+
+    let t_start = (date now)
+    tty_report $"\n\e[36m[call]\e[0m ($agent_name)/($fn_name) ($formatted_args)\n"
     let res = (^nu $tool_path ...$pos_args ...$named_args | complete)
-    tty_report ("\n[done] tool: " + $fn_name + "\n")
+    let t_dur = ((date now) - $t_start)
 
     if $res.exit_code == 0 {
-        if not ($res.stdout | is-empty) { $res.stdout } else { "(Success with no output)" }
+        let output = (if not ($res.stdout | is-empty) { $res.stdout } else { "(Success with no output)" })
+        let n_lines = ($output | lines | length)
+        let n_bytes = ($output | str length | into filesize)
+        # Print the entire tool output so the user can inspect intermediate results and context
+        tty_report $"($output)\n"
+        tty_report $"\e[32m[done]\e[0m ($agent_name)/($fn_name) -> ($n_lines) lines, ($n_bytes) \(took ($t_dur)\)\n\n"
+        $output
     } else {
+        tty_report $"\e[31m[error]\e[0m ($agent_name)/($fn_name) -> exit ($res.exit_code) \(took ($t_dur)\)\n"
+        if not ($res.stderr | is-empty) { tty_report $"($res.stderr)\n" }
+        if not ($res.stdout | is-empty) { tty_report $"($res.stdout)\n" }
+        tty_report "\n"
         $"Error: ($res.stderr)\n($res.stdout)"
     }
 }
@@ -187,7 +214,7 @@ def run_agent [
     query: string
     image_path: string = ""
     slot_override: int = -1
-    no_mdc: bool = false
+    no_md: bool = false
 ] {
     let parsed = (parse_spec $spec_str)
     let agent_name = $parsed.agent
@@ -205,7 +232,7 @@ def run_agent [
     let system_prompt = (if ($prompt_file | path exists) { open --raw $prompt_file } else { $"You are the Ken ($agent_name) agent." })
 
     # Tools
-    let tools = (if $agent_name != "cmd" and $model_id != "lfm" {
+    let tools = (if $agent_name != "cmd" {
         get_agent_tools $agent_dir
     } else {
         []
@@ -218,13 +245,13 @@ def run_agent [
     let assigned_slot = (if $slot_override >= 0 { $slot_override } else { $agent_idx mod 2 })
 
     # Slot snapshot check
-    let slots_dir = (get_slots_dir)
+    let slots_dir = (get_slots_dir $model_id)
     let snapshot_file = ($slots_dir | path join $"($agent_name).bin")
     let has_snapshot = ($snapshot_file | path exists)
 
-    if $model_id == "qwen" and $has_snapshot {
+    if $has_snapshot {
         try {
-            http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=restore" ({ model: "qwen", filename: $"($agent_name).bin" } | to json -r)
+            http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=restore" ({ model: $model_id, filename: $"($agent_name).bin" } | to json -r)
         }
     }
 
@@ -257,7 +284,7 @@ def run_agent [
 
     $messages = ($messages | append { role: "user", content: $user_content })
 
-    let is_interactive = (is-terminal --stdout) and ($env.TERM? != "dumb") and (not $no_mdc)
+    let is_interactive = (is-terminal --stdout) and ($env.TERM? != "dumb") and (not $no_md)
     mut final_timings: any = null
     mut final_usage: any = null
 
@@ -284,12 +311,10 @@ def run_agent [
         mut current_line = ""
 
         if $is_interactive {
-            print -n "\e7" # Save cursor at start of line
+            print -n "\e7" # Save cursor at start of first line
         }
 
-        let curl_stream = (^curl -s -N $LLAMA_URL -H "Content-Type: application/json" -d ($payload | to json -r) | lines)
-
-        for line in $curl_stream {
+        for line in (^curl -s -N --no-buffer $LLAMA_URL -H "Content-Type: application/json" -d ($payload | to json -r) | lines) {
             if not ($line | str starts-with "data: {") {
                 continue
             }
@@ -314,7 +339,7 @@ def run_agent [
                 }
             }
 
-            # Content tokens
+            # Content tokens (progressive bat line highlighting with cursor restore)
             let c_tok = ($delta.content? | default "")
             if not ($c_tok | is-empty) {
                 $turn_content = ($turn_content + $c_tok)
@@ -326,20 +351,42 @@ def run_agent [
                             let part = ($parts | get $idx)
                             $current_line = ($current_line + $part)
                             if $idx < ($p_count - 1) {
-                                # Completed line
+                                # Newline reached: style line with bat, commit newline, save cursor for next line
                                 let styled = (style_line $current_line)
-                                print -n ("\e8\e[0J" + $styled + "\n\e7")
+                                let term_cols = (try { term size | get columns } catch { 80 })
+                                let line_len = ($current_line | str length)
+                                let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
+                                if $lines_up > 0 {
+                                    print -n $"\e[($lines_up)A\r\e[0J($styled)\n\e7"
+                                } else {
+                                    print -n $"\e8\e[0J($styled)\n\e7"
+                                }
                                 $current_line = ""
                             } else if not ($current_line | is-empty) {
-                                # Trailing partial line
+                                # Partial line after newline: restore cursor and style
                                 let styled = (style_line $current_line)
-                                print -n ("\e8\e[0J" + $styled)
+                                let term_cols = (try { term size | get columns } catch { 80 })
+                                let line_len = ($current_line | str length)
+                                let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
+                                if $lines_up > 0 {
+                                    print -n $"\e[($lines_up)A\r\e[0J($styled)"
+                                } else {
+                                    print -n $"\e8\e[0J($styled)"
+                                }
                             }
                         }
                     } else {
+                        # Token in current line: restore cursor, clear to end of screen and highlight with bat
                         $current_line = ($current_line + $c_tok)
                         let styled = (style_line $current_line)
-                        print -n ("\e8\e[0J" + $styled)
+                        let term_cols = (try { term size | get columns } catch { 80 })
+                        let line_len = ($current_line | str length)
+                        let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
+                        if $lines_up > 0 {
+                            print -n $"\e[($lines_up)A\r\e[0J($styled)"
+                        } else {
+                            print -n $"\e8\e[0J($styled)"
+                        }
                     }
                 } else {
                     print -n $c_tok
@@ -354,7 +401,7 @@ def run_agent [
         }
 
         if $is_interactive and not ($current_line | is-empty) {
-            print "" # newline after stream finishes
+            print ""
         }
 
         # Check for tool calls
@@ -400,9 +447,9 @@ def run_agent [
         })
 
         # Save snapshot if first time
-        if (not $has_snapshot) and ($model_id == "qwen") {
+        if (not $has_snapshot) {
             try {
-                http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=save" ({ model: "qwen", filename: $"($agent_name).bin" } | to json -r)
+                http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=save" ({ model: $model_id, filename: $"($agent_name).bin" } | to json -r)
             }
         }
 
@@ -456,8 +503,10 @@ def "main tok" [
     --model (-m): string = "qwen"
     --json
 ] {
-    let piped_input = ($in | default "")
-    if ($patterns | is-empty) and not ($piped_input | is-empty) {
+    let has_stdin = (not (is-terminal --stdin))
+    let piped_input = (if $has_stdin { try { open --raw /dev/stdin } catch { "" } } else { "" })
+
+    if not ($piped_input | is-empty) {
         let content = $piped_input
         let res = (try {
             http post --content-type "application/json" $TOKENIZE_URL ({ model: $model, content: $content } | to json -r)
@@ -468,13 +517,15 @@ def "main tok" [
             { source: "stdin", model: $model, bytes: $n_bytes, tokens: $n_tokens } | to json
         } else {
             let pct = (($n_tokens / $DEFAULT_CTX) * 100 | math round -p 1)
-            print $"Tokens: ($n_tokens) | Size: ($n_bytes) B | ($pct)% of ($DEFAULT_CTX) ctx \(($model)\)"
+            let sz = ($n_bytes | into filesize)
+            print $"Tokens: ($n_tokens) | Size: ($sz) | ($pct)% of ($DEFAULT_CTX) ctx \(($model)\)"
         }
         return
     }
 
     if ($patterns | is-empty) {
-        print "Usage: ken tok [patterns...] [--model qwen|lfm] [--json]"
+        print "Usage: cat file | ken tok"
+        print "       ken tok [patterns...] [--model qwen|lfm] [--json]"
         return
     }
 
@@ -540,11 +591,20 @@ def "main tok" [
     print ("Total: " + ($results | length | into string) + " files | " + ($total_sz | into string) + " | " + ($total_tokens | into string) + " tokens (" + ($pct | into string) + "% of " + ($DEFAULT_CTX | into string) + " ctx [" + $model + "])")
 }
 
-# Subcommand: mdc (Progressive Markdown syntax colorer)
-def "main mdc" [
+# Subcommand: md (Displays colored markdown)
+def "main md" [
+    file?: string
     --lang: string = "markdown"
 ] {
-    ^bat --plain --paging=never --color=always -l $lang
+    let has_stdin = (not (is-terminal --stdin))
+    if not ($file | is-empty) and ($file | path exists) {
+        ^bat --plain --paging=never --color=always -l $lang $file
+    } else if $has_stdin {
+        ^bat --plain --paging=never --color=always -l $lang
+    } else {
+        print "Usage: ken md [file.md]"
+        print "       cat file.md | ken md"
+    }
 }
 
 # Subcommand: list (List agents and tools)
@@ -623,16 +683,17 @@ def main [
     query?: string
     --image (-i): string = ""
     --slot: int = -1
-    --no-mdc
+    --no-md
 ] {
-    let piped_input = ($in | default "")
+    let has_stdin = (not (is-terminal --stdin))
+    let piped_input = (if $has_stdin { try { open --raw /dev/stdin } catch { "" } } else { "" })
     if $spec == null or $spec in ["-h" "--help"] {
         print "Usage: ken [session][agent.]<model> [query] [options]"
         print "       ken <subcommand>"
         print "\nSubcommands:"
         print "  ken list                  List agents and tools"
         print "  ken tok [patterns...]     Count tokens via llama.cpp"
-        print "  ken mdc                   Markdown color filter"
+        print "  ken md [file]             Display colored markdown"
         print "  ken schema [agent]        Dump OpenAI tools schema"
         print "  ken session [list|clear]  Manage persistent sessions"
         print "\nExamples:"
@@ -656,5 +717,5 @@ def main [
         return
     }
 
-    run_agent $spec $full_query $image $slot $no_mdc
+    run_agent $spec $full_query $image $slot $no_md
 }
