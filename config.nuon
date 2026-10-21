@@ -27,6 +27,12 @@
                     ctx: 8192
                     pricing: { input: 0.0, output: 0.0, cache_hit: 0.0 }
                 }
+                w: {
+                    name: "w"
+                    description: "Qwen 2.5 2B Instruct (Local GPU - Lightweight)"
+                    ctx: 16384
+                    pricing: { input: 0.0, output: 0.0, cache_hit: 0.0 }
+                }
             }
         }
 

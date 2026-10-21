@@ -332,6 +332,19 @@ def get_agent_tools [agent_dir: string] {
             }
         }
 
+        # For call_agent: scope available agents strictly to symlinked *.k in this agent's directory
+        if $tool_name == "call_agent" {
+            let available_agents = (glob ($agent_dir | path join "*.k") | each { path parse | get stem } | sort)
+            if ($available_agents | is-empty) {
+                # If no agents are symlinked to this agent, omit call_agent entirely
+                continue
+            }
+            if ($properties | get -o agent) != null {
+                let p_agent = ($properties.agent | insert enum $available_agents | upsert description $"Target agent to delegate to \(available: ($available_agents | str join ', ')\)")
+                $properties = ($properties | upsert agent $p_agent)
+            }
+        }
+
         $tools = ($tools | append {
             type: "function"
             function: {

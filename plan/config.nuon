@@ -1,0 +1,5 @@
+{
+    name: "plan"
+    description: "Session-scoped autonomous planning and workflow director powered by DeepSeek-R1"
+    default_model: "dskr"
+}
