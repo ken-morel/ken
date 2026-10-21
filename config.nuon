@@ -1,0 +1,16 @@
+{
+    default_model: "qwen"
+    default_ctx: 16384
+    options: {}
+    models: {
+        lfm: {
+            temperature: 0.1
+        }
+        qwen: {
+            temperature: 0.6
+        }
+        dsk: {
+            temperature: 0.6
+        }
+    }
+}

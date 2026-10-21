@@ -1,0 +1,7 @@
+{
+    name: "mem"
+    description: "Long-term memory search, retrieval, and knowledge recording"
+    default_model: "lfm"
+    options: {}
+    models: {}
+}

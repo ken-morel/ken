@@ -1,0 +1,11 @@
+{
+    name: "notes"
+    description: "Academic & coursework notes specialist"
+    default_model: "lfm"
+    options: {}
+    models: {
+        lfm: { temperature: 0.1 }
+        qwen: { temperature: 0.6 }
+        dsk: { temperature: 0.6 }
+    }
+}

@@ -41,8 +41,8 @@ Student Question:
 ($question)
 
 Instructions:
-Extract the exact definitions, theorems, formulas, or answers from the note above.
-Be precise and cite exact equations or sections.
+Extract all content, definitions, theorems, formulas, code, diagrams, and explanations regarding '($question)' from the note above.
+Be thorough and mathematically precise. Quote relevant formulas, definitions, and rules verbatim without summarizing away essential technical details.
 If the information is not in this note, say 'Not mentioned in this note'. Output clean plain ASCII text."
 
     let payload = {
@@ -51,7 +51,7 @@ If the information is not in this note, say 'Not mentioned in this note'. Output
             { role: "user", content: $prompt }
         ]
         temperature: 0.1
-        max_tokens: 1024
+        max_tokens: 2048
         stream: false
     }
 

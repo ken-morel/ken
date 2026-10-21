@@ -4,6 +4,7 @@
 const LLAMA_URL = "http://127.0.0.1:6172/v1/chat/completions"
 const TOKENIZE_URL = "http://127.0.0.1:6172/tokenize"
 const SLOTS_URL = "http://127.0.0.1:6172/slots"
+const DEFAULT_MODEL = "qwen"
 const DEFAULT_CTX = 16384
 
 def get_ken_root [] {
@@ -17,13 +18,46 @@ def get_ken_root [] {
     $env.FILE_PWD? | default ($env.HOME | path join "ken")
 }
 
+def get_known_models [] {
+    let from_api = (try {
+        http get --max-time 1sec "http://127.0.0.1:6172/v1/models" | get data.id
+    } catch { [] })
+    if not ($from_api | is-empty) {
+        return $from_api
+    }
+
+    let ini_path = ($env.HOME | path join "models" "models.ini")
+    if ($ini_path | path exists) {
+        return (open $ini_path | lines | where ($it | str starts-with "[") and ($it != "[*]") | each { str replace "[" "" | str replace "]" "" | str trim })
+    }
+
+    [$DEFAULT_MODEL]
+}
+
+def get_model_ctx [model: string] {
+    let models_res = (try { http get --max-time 1sec "http://127.0.0.1:6172/v1/models" } catch { null })
+    if $models_res != null {
+        let m_data = ($models_res.data? | default [] | where id == $model | first)
+        let ctx = ($m_data.meta?.n_ctx? | default null)
+        if $ctx != null { return ($ctx | into int) }
+        let args = ($m_data.status?.args? | default [])
+        for idx in 0..(($args | length) - 1) {
+            if ($args | get -o $idx) == "--ctx-size" {
+                let val = ($args | get -o ($idx + 1))
+                if $val != null { return ($val | into int) }
+            }
+        }
+    }
+    $DEFAULT_CTX
+}
+
 def get_session_dir [] {
     let d = ($env.HOME | path join ".cache" "ken" "sessions")
     mkdir $d
     $d
 }
 
-def get_slots_dir [model: string = "qwen"] {
+def get_slots_dir [model: string = $DEFAULT_MODEL] {
     let d = ($env.HOME | path join ".cache" $"($model)-server" "slots")
     mkdir $d
     $d
@@ -37,45 +71,105 @@ def tty_report [msg: string] {
     }
 }
 
-# Parse model specifier: [session][agent.]<model>
+def load_root_config [] {
+    let ken_root = (get_ken_root)
+    let conf_path = ($ken_root | path join "config.nuon")
+    mut root_conf = {
+        default_model: $DEFAULT_MODEL
+        default_ctx: $DEFAULT_CTX
+        options: {}
+        models: {}
+    }
+    if ($conf_path | path exists) {
+        let loaded = (try { open $conf_path } catch { {} })
+        $root_conf = ($root_conf | merge ($loaded | default {}))
+    }
+    $root_conf
+}
+
+def load_agent_config [agent_dir: string, root_conf?: record] {
+    let base_conf = (if $root_conf != null { $root_conf } else { load_root_config })
+    let conf_path = ($agent_dir | path join "config.nuon")
+    mut agent_conf = {
+        name: ($agent_dir | path basename)
+        description: ""
+        default_model: $base_conf.default_model
+        options: $base_conf.options
+        models: $base_conf.models
+        system_prompt: ""
+    }
+
+    if ($conf_path | path exists) {
+        let loaded = (try { open $conf_path } catch { {} })
+        if ($loaded.name? | default "" | is-not-empty) { $agent_conf.name = $loaded.name }
+        if ($loaded.description? | default "" | is-not-empty) { $agent_conf.description = $loaded.description }
+        if ($loaded.default_model? | default "" | is-not-empty) { $agent_conf.default_model = $loaded.default_model }
+        if ($loaded.options? != null) {
+            $agent_conf.options = ($agent_conf.options | merge ($loaded.options | default {}))
+        }
+        if ($loaded.models? != null) {
+            $agent_conf.models = ($agent_conf.models | merge ($loaded.models | default {}))
+        }
+        if ($loaded.system_prompt? | default "" | is-not-empty) {
+            $agent_conf.system_prompt = $loaded.system_prompt
+        }
+    }
+
+    if ($agent_conf.system_prompt | default "" | is-empty) {
+        let prompt_path = ($agent_dir | path join "prompt.md")
+        if ($prompt_path | path exists) {
+            $agent_conf.system_prompt = (open --raw $prompt_path)
+        } else {
+            $agent_conf.system_prompt = $"You are the Ken ($agent_conf.name) agent."
+        }
+    }
+
+    $agent_conf
+}
+
+def resolve_model_params [agent_conf: record, model_id: string] {
+    let global_opts = ($agent_conf.options? | default {})
+    let model_opts = ($agent_conf.models? | default {} | get -o $model_id | default {})
+    $global_opts | merge $model_opts
+}
+
+# Parse model specifier dynamically: [session][agent.]<model> or [session][agent] or [session][model]
 def parse_spec [spec_str: string] {
-    let raw = ($spec_str | default "")
-    
-    # Try: (digits)?(agent.)?(model)
-    let p1 = ($raw | parse -r '^(?:(?<session>\d+))?(?:(?<agent>[a-zA-Z0-9_-]+)\.)?(?<model>qwent|qwen|lfm|dskt|dsk)$')
-    if not ($p1 | is-empty) {
-        let row = ($p1 | first)
-        let s = (if ($row.session | is-empty) { null } else { $row.session })
-        let a = (if ($row.agent | is-empty) { "orchestrator" } else { $row.agent })
-        let m_spec = $row.model
-        let is_thinking = ($m_spec in ["qwent" "dskt"])
-        let m = match $m_spec {
-            "lfm" => "lfm"
-            "dsk" | "dskt" => "dsk"
-            _ => "qwen"
-        }
-        return { session: $s, agent: $a, model: $m, thinking: $is_thinking }
+    let raw = ($spec_str | default "" | str trim)
+    if ($raw | is-empty) {
+        return { session: null, agent: "orchestrator", model: null, model_explicit: false }
     }
 
-    # Fallback: (digits)?(agent)
-    let p2 = ($raw | parse -r '^(?:(?<session>\d+))?(?<agent>[a-zA-Z0-9_-]+)$')
-    if not ($p2 | is-empty) {
-        let row = ($p2 | first)
-        let s = (if ($row.session | is-empty) { null } else { $row.session })
-        let a = $row.agent
-        if $a in ["qwen" "qwent" "lfm" "dsk" "dskt"] {
-            let is_thinking = ($a in ["qwent" "dskt"])
-            let m = match $a {
-                "lfm" => "lfm"
-                "dsk" | "dskt" => "dsk"
-                _ => "qwen"
-            }
-            return { session: $s, agent: "orchestrator", model: $m, thinking: $is_thinking }
-        }
-        return { session: $s, agent: $a, model: "qwen", thinking: false }
+    let p_sess = ($raw | parse -r '^(?<session>\d+)?(?<rest>.*)$' | first)
+    let session = (if ($p_sess.session? | default "" | is-empty) { null } else { $p_sess.session })
+    let rest = $p_sess.rest
+    let ken_root = (get_ken_root)
+
+    # 1. Explicit dot notation: <agent>.<model>
+    if ($rest | str contains ".") {
+        let parts = ($rest | split row ".")
+        let a = ($parts | get 0)
+        let m = ($parts | get 1)
+        return { session: $session, agent: $a, model: $m, model_explicit: true }
     }
 
-    { session: null, agent: "orchestrator", model: "qwen", thinking: false }
+    # 2. Check if name matches an existing agent folder in ken
+    let agent_path = ($ken_root | path join $rest)
+    if ($agent_path | path exists) {
+        return { session: $session, agent: $rest, model: null, model_explicit: false }
+    }
+
+    # 3. Model alias or direct model name: check if ending with 't' matches a known model (e.g. qwent -> qwen)
+    let known = (get_known_models)
+    mut model_name = $rest
+    if ($model_name not-in $known) and ($model_name | str ends-with "t") {
+        let trimmed_m = ($model_name | str substring 0..(-2))
+        if $trimmed_m in $known {
+            $model_name = $trimmed_m
+        }
+    }
+
+    { session: $session, agent: "orchestrator", model: $model_name, model_explicit: true }
 }
 
 def resolve_agent_dir [agent: string] {
@@ -218,8 +312,6 @@ def run_agent [
 ] {
     let parsed = (parse_spec $spec_str)
     let agent_name = $parsed.agent
-    let model_id = $parsed.model
-    let thinking = $parsed.thinking
     let session_id = $parsed.session
 
     let agent_dir = (resolve_agent_dir $agent_name)
@@ -228,15 +320,20 @@ def run_agent [
         return
     }
 
-    let prompt_file = ($agent_dir | path join "prompt.md")
-    let system_prompt = (if ($prompt_file | path exists) { open --raw $prompt_file } else { $"You are the Ken ($agent_name) agent." })
-
-    # Tools
-    let tools = (if $agent_name != "cmd" {
-        get_agent_tools $agent_dir
+    let root_conf = (load_root_config)
+    let agent_conf = (load_agent_config $agent_dir $root_conf)
+    let system_prompt = $agent_conf.system_prompt
+    let model_id = (if $parsed.model_explicit {
+        $parsed.model
     } else {
-        []
+        $agent_conf.default_model? | default $root_conf.default_model
     })
+
+    # Tools: dynamically introspect tools in agent directory
+    let tools = (get_agent_tools $agent_dir)
+
+    # Model parameters from cascading config (options + models.<model_id>)
+    let model_params = (resolve_model_params $agent_conf $model_id)
 
     # Slot allocation by alphabetical agent index
     let root = (get_ken_root)
@@ -244,14 +341,23 @@ def run_agent [
     let agent_idx = ($all_agents | enumerate | where item == $agent_name | get 0.index? | default 0)
     let assigned_slot = (if $slot_override >= 0 { $slot_override } else { $agent_idx mod 2 })
 
-    # Slot snapshot check
+    # Slot snapshot check: restore if cached and up-to-date with agent prompt/config
     let slots_dir = (get_slots_dir $model_id)
-    let snapshot_file = ($slots_dir | path join $"($agent_name).bin")
-    let has_snapshot = ($snapshot_file | path exists)
+    let snap_filename = $"($agent_name)_($model_id).bin"
+    let snapshot_file = ($slots_dir | path join $snap_filename)
+    let snap_exists = ($snapshot_file | path exists)
+    mut snapshot_restored = false
 
-    if $has_snapshot {
-        try {
-            http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=restore" ({ model: $model_id, filename: $"($agent_name).bin" } | to json -r)
+    if $snap_exists {
+        let snap_mtime = (ls $snapshot_file | get 0.modified)
+        let agent_mtime = (try { ls $agent_dir | get modified | math max } catch { null })
+        if ($agent_mtime == null) or ($snap_mtime >= $agent_mtime) {
+            let res = (try {
+                http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=restore" ({ model: $model_id, filename: $snap_filename } | to json -r)
+            } catch { null })
+            if $res != null and ($res.timings?.restore_ms? != null) {
+                $snapshot_restored = true
+            }
         }
     }
 
@@ -298,8 +404,8 @@ def run_agent [
             timings_per_token: true
             cache_prompt: true
             id_slot: $assigned_slot
-            temperature: (if $thinking { 0.6 } else { 0.2 })
         }
+        $payload = ($payload | merge $model_params)
         if not ($tools | is-empty) {
             $payload = ($payload | insert tools $tools)
         }
@@ -334,9 +440,7 @@ def run_agent [
             let r_tok = ($delta.reasoning_content? | default "")
             if not ($r_tok | is-empty) {
                 $turn_reasoning = ($turn_reasoning + $r_tok)
-                if $thinking {
-                    print -n ("\e[2m" + $r_tok + "\e[0m")
-                }
+                print -n ("\e[2m" + $r_tok + "\e[0m")
             }
 
             # Content tokens (progressive bat line highlighting with cursor restore)
@@ -446,11 +550,12 @@ def run_agent [
             content: $turn_content
         })
 
-        # Save snapshot if first time
-        if (not $has_snapshot) {
+        # Save snapshot if it was not restored (missing or updated)
+        if (not $snapshot_restored) {
             try {
-                http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=save" ({ model: $model_id, filename: $"($agent_name).bin" } | to json -r)
+                http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=save" ({ model: $model_id, filename: $snap_filename } | to json -r)
             }
+            $snapshot_restored = true
         }
 
         # Footer stats banner
@@ -500,32 +605,35 @@ def run_agent [
 # Subcommand: tok (Count tokens)
 def "main tok" [
     ...patterns: string
-    --model (-m): string = "qwen"
+    --model (-m): string = ""
     --json
 ] {
+    let root_conf = (load_root_config)
+    let target_model = (if not ($model | is-empty) { $model } else { $root_conf.default_model })
+    let model_ctx = (get_model_ctx $target_model)
     let has_stdin = (not (is-terminal --stdin))
     let piped_input = (if $has_stdin { try { open --raw /dev/stdin } catch { "" } } else { "" })
 
     if not ($piped_input | is-empty) {
         let content = $piped_input
         let res = (try {
-            http post --content-type "application/json" $TOKENIZE_URL ({ model: $model, content: $content } | to json -r)
+            http post --content-type "application/json" $TOKENIZE_URL ({ model: $target_model, content: $content } | to json -r)
         } catch { { tokens: [] } })
         let n_tokens = ($res.tokens | length)
         let n_bytes = ($content | str length)
         if $json {
-            { source: "stdin", model: $model, bytes: $n_bytes, tokens: $n_tokens } | to json
+            { source: "stdin", model: $target_model, bytes: $n_bytes, tokens: $n_tokens } | to json
         } else {
-            let pct = (($n_tokens / $DEFAULT_CTX) * 100 | math round -p 1)
+            let pct = (($n_tokens / $model_ctx) * 100 | math round -p 1)
             let sz = ($n_bytes | into filesize)
-            print $"Tokens: ($n_tokens) | Size: ($sz) | ($pct)% of ($DEFAULT_CTX) ctx \(($model)\)"
+            print $"Tokens: ($n_tokens) | Size: ($sz) | ($pct)% of ($model_ctx) ctx \(($target_model)\)"
         }
         return
     }
 
     if ($patterns | is-empty) {
         print "Usage: cat file | ken tok"
-        print "       ken tok [patterns...] [--model qwen|lfm] [--json]"
+        print "       ken tok [patterns...] [--model <name>] [--json]"
         return
     }
 
@@ -554,7 +662,7 @@ def "main tok" [
         let text = (try { open --raw $f } catch { "" })
         let bytes_n = ($text | str length)
         let res = (try {
-            http post --content-type "application/json" $TOKENIZE_URL ({ model: $model, content: $text } | to json -r)
+            http post --content-type "application/json" $TOKENIZE_URL ({ model: $target_model, content: $text } | to json -r)
         } catch { { tokens: [] } })
         let tokens_n = ($res.tokens | length)
 
@@ -572,12 +680,12 @@ def "main tok" [
 
     if $json {
         {
-            model: $model
+            model: $target_model
             total_files: ($results | length)
             total_bytes: $total_bytes
             total_tokens: $total_tokens
-            ctx_size: $DEFAULT_CTX
-            ctx_percent: (($total_tokens / $DEFAULT_CTX) * 100 | math round -p 1)
+            ctx_size: $model_ctx
+            ctx_percent: (($total_tokens / $model_ctx) * 100 | math round -p 1)
             files: $results
         } | to json
         return
@@ -585,10 +693,10 @@ def "main tok" [
 
     # Print table
     print ($results | table -e)
-    let pct = (($total_tokens / $DEFAULT_CTX) * 100 | math round -p 1)
+    let pct = (($total_tokens / $model_ctx) * 100 | math round -p 1)
     let total_sz = ($total_bytes | into filesize)
     print ("------------------------------------------------------------")
-    print ("Total: " + ($results | length | into string) + " files | " + ($total_sz | into string) + " | " + ($total_tokens | into string) + " tokens (" + ($pct | into string) + "% of " + ($DEFAULT_CTX | into string) + " ctx [" + $model + "])")
+    print ("Total: " + ($results | length | into string) + " files | " + ($total_sz | into string) + " | " + ($total_tokens | into string) + " tokens (" + ($pct | into string) + "% of " + ($model_ctx | into string) + " ctx [" + $target_model + "])")
 }
 
 # Subcommand: md (Displays colored markdown)
@@ -610,17 +718,89 @@ def "main md" [
 # Subcommand: list (List agents and tools)
 def "main list" [] {
     let root = (get_ken_root)
+    let root_conf = (load_root_config)
     let agents = (ls $root | where type == dir and (not ($it.name | path basename | str starts-with ".")) and ($it.name | path basename) != "bin" | sort-by name)
-    print "Available Ken Agents & Tools:"
+    print $"Available Ken Agents [default: ($root_conf.default_model)]:\n"
     for a in $agents {
         let a_name = ($a.name | path basename)
+        let a_conf = (load_agent_config $a.name $root_conf)
         let nu_files = (glob ($a.name | path join "*.nu") | each { path parse | get stem } | sort)
-        let has_prompt = (if (($a.name | path join "prompt.md") | path exists) { " [has prompt.md]" } else { "" })
-        print $"- ($a_name)($has_prompt):"
+        let desc = (if not ($a_conf.description | is-empty) { $" - ($a_conf.description)" } else { "" })
+        let def_m = $a_conf.default_model
+        print $"- \e[1;36m($a_name)\e[0m [($def_m)]($desc):"
         if not ($nu_files | is-empty) {
             print $"    tools: ($nu_files | str join ', ')"
         } else {
             print "    tools: (none)"
+        }
+    }
+}
+
+# Subcommand: prefill (Warm up and save slot snapshots for agents)
+def "main prefill" [
+    agent?: string
+    --model (-m): string = ""
+    --all
+] {
+    let ken_root = (get_ken_root)
+    let root_conf = (load_root_config)
+    let all_dirs = (ls $ken_root | where type == dir and (not ($it.name | path basename | str starts-with ".")) and ($it.name | path basename) != "bin" | get name | sort)
+
+    let target_dirs = (if not ($agent | is-empty) and not $all {
+        let specific = (resolve_agent_dir $agent)
+        if ($specific | path exists) { [$specific] } else { [] }
+    } else {
+        $all_dirs
+    })
+
+    if ($target_dirs | is-empty) {
+        print -e $"No matching agents found to prefill."
+        return
+    }
+
+    print $"Prefilling and saving snapshots for ($target_dirs | length) agents..."
+    for adir in $target_dirs {
+        let a_name = ($adir | path basename)
+        let a_conf = (load_agent_config $adir $root_conf)
+        let target_model = (if not ($model | is-empty) { $model } else { $a_conf.default_model })
+        let tools = (get_agent_tools $adir)
+        let prompt = $a_conf.system_prompt
+        let snap_filename = $"($a_name)_($target_model).bin"
+
+        print -n $"Prefilling ($a_name) [($target_model)]... "
+        mut payload = {
+            model: $target_model
+            messages: [
+                { role: "system", content: $prompt }
+                { role: "user", content: " " }
+            ]
+            max_tokens: 1
+            id_slot: 0
+            cache_prompt: true
+        }
+        if not ($tools | is-empty) {
+            $payload = ($payload | insert tools $tools)
+        }
+
+        let run_res = (try {
+            http post --content-type "application/json" --max-time 60sec $LLAMA_URL ($payload | to json -r)
+        } catch { |e| null })
+
+        if $run_res == null {
+            print $"\e[31m[failed]\e[0m"
+            continue
+        }
+
+        let save_res = (try {
+            http post --content-type "application/json" $"($SLOTS_URL)/0?action=save" ({ model: $target_model, filename: $snap_filename } | to json -r)
+        } catch { |e| null })
+
+        if $save_res != null and ($save_res.timings?.save_ms? != null) {
+            let ms = ($save_res.timings.save_ms | math round -p 1)
+            let n_tokens = ($save_res.n_saved? | default 0)
+            print $"\e[32m[ok]\e[0m saved ($n_tokens) tokens in ($ms)ms -> ($snap_filename)"
+        } else {
+            print $"\e[31m[failed to save snapshot]\e[0m"
         }
     }
 }
@@ -691,7 +871,8 @@ def main [
         print "Usage: ken [session][agent.]<model> [query] [options]"
         print "       ken <subcommand>"
         print "\nSubcommands:"
-        print "  ken list                  List agents and tools"
+        print "  ken list                  List agents, default models, and tools"
+        print "  ken prefill [agent]       Pre-evaluate & save prompt snapshots"
         print "  ken tok [patterns...]     Count tokens via llama.cpp"
         print "  ken md [file]             Display colored markdown"
         print "  ken schema [agent]        Dump OpenAI tools schema"

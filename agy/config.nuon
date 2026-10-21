@@ -1,0 +1,7 @@
+{
+    name: "agy"
+    description: "Antigravity task delegation and coding escalation"
+    default_model: "qwen"
+    options: {}
+    models: {}
+}
