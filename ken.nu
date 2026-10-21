@@ -516,6 +516,17 @@ def run_agent [
     mut final_timings: any = null
     mut final_usage: any = null
 
+    let cur_session = ($session_id | default "default")
+
+    # Export execution context to tools and subagents
+    load-env {
+        KEN_SESSION: $cur_session
+        KEN_AGENT: $agent_name
+        KEN_MODEL: $model_alias
+        KEN_ROOT: $root
+        KEN_DEPTH: ($env.KEN_DEPTH? | default "0")
+    }
+
     # Conversation / tool-calling turns (up to 8)
     for turn in 0..7 {
         mut payload = {
