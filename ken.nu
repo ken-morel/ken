@@ -798,9 +798,9 @@ def run_agent [
         if (is-terminal --stdout) and ($turn_timings != null or $turn_usage != null) {
             mut banner_parts = [$"--- ($model_alias)"]
             let ctx_info = (if $cache_n > 0 {
-                $"ctx: ($prompt_n)+($pred_n) \(($cache_n) cached\)"
+                $"ctx: ($prompt_n) in + ($pred_n) out \(($cache_n) cached\)"
             } else {
-                $"ctx: ($prompt_n)+($pred_n)"
+                $"ctx: ($prompt_n) in + ($pred_n) out"
             })
             $banner_parts = ($banner_parts | append $ctx_info)
             if $ttft_ms > 0 {
@@ -827,9 +827,8 @@ def run_agent [
                 cost_usd: $cost_res.usd
                 cost_cfa: $cost_res.cfa
             }
-            if not $cost_res.is_free {
-                $banner_parts = ($banner_parts | append $"cost: ($cost_res.label)")
-            }
+            let cost_label = (if $cost_res.is_free { "free" } else { $cost_res.label })
+            $banner_parts = ($banner_parts | append $"cost: ($cost_label)")
 
             $banner_parts = ($banner_parts | append "---")
             let line = ($banner_parts | str join " | ")
@@ -1238,9 +1237,9 @@ def "main raw" [
 
         mut raw_parts = [$"[raw/($model)]"]
         let ctx_str = if $cache_n > 0 {
-            $"ctx: ($prompt_n)+($pred_n) \(($cache_n) cached\)"
+            $"ctx: ($prompt_n) in + ($pred_n) out \(($cache_n) cached\)"
         } else {
-            $"ctx: ($prompt_n)+($pred_n)"
+            $"ctx: ($prompt_n) in + ($pred_n) out"
         }
         $raw_parts = ($raw_parts | append $ctx_str)
         if $ttft_ms > 0 {
@@ -1253,9 +1252,8 @@ def "main raw" [
 
         let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
         let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
-        if not $cost_res.is_free {
-            $raw_parts = ($raw_parts | append $"cost: ($cost_res.label)")
-        }
+        let cost_label = (if $cost_res.is_free { "free" } else { $cost_res.label })
+        $raw_parts = ($raw_parts | append $"cost: ($cost_label)")
 
         record_metric {
             source: "raw"
