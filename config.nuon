@@ -59,7 +59,7 @@
                     name: "gemini-3-flash-preview"
                     description: "Gemini 3 Flash Preview (Google AI Studio)"
                     ctx: 1048576
-                    pricing: { input: 0.0, output: 0.0, cache_hit: 0.0 }
+                    pricing: { input: 0.15, output: 0.60, cache_hit: 0.0375 }
                 }
                 gp: {
                     name: "gemini-3.1-pro-preview"

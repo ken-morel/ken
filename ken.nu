@@ -385,7 +385,7 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
     } | str join " ")
 
     let t_start = (date now)
-    tty_report $"\n\e[36m[call]\e[0m ($agent_name)/($fn_name) ($formatted_args)\n"
+    tty_report $"\n(ansi cyan)[call](ansi reset) ($agent_name)/($fn_name) ($formatted_args)\n"
     let res = (^nu $tool_path ...$pos_args ...$named_args | complete)
     let t_dur = ((date now) - $t_start)
 
@@ -395,10 +395,10 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
         let n_bytes = ($output | str length | into filesize)
         # Print the entire tool output so the user can inspect intermediate results and context
         tty_report $"($output)\n"
-        tty_report $"\e[32m[done]\e[0m ($agent_name)/($fn_name) -> ($n_lines) lines, ($n_bytes) \(took ($t_dur)\)\n\n"
+        tty_report $"(ansi green)[done](ansi reset) ($agent_name)/($fn_name) -> ($n_lines) lines, ($n_bytes) \(took ($t_dur)\)\n\n"
         $output
     } else {
-        tty_report $"\e[31m[error]\e[0m ($agent_name)/($fn_name) -> exit ($res.exit_code) \(took ($t_dur)\)\n"
+        tty_report $"(ansi red)[error](ansi reset) ($agent_name)/($fn_name) -> exit ($res.exit_code) \(took ($t_dur)\)\n"
         if not ($res.stderr | is-empty) { tty_report $"($res.stderr)\n" }
         if not ($res.stdout | is-empty) { tty_report $"($res.stdout)\n" }
         tty_report "\n"
@@ -573,7 +573,7 @@ def run_agent [
             let r_tok = ($delta.reasoning_content? | default "")
             if not ($r_tok | is-empty) {
                 $turn_reasoning = ($turn_reasoning + $r_tok)
-                print -n ("\e[2m" + $r_tok + "\e[0m")
+                print -n $"(ansi d)($r_tok)(ansi reset)"
             }
 
             # Content tokens (progressive bat line highlighting with cursor restore)
@@ -633,7 +633,14 @@ def run_agent [
             # Tool call deltas
             let tc = ($delta.tool_calls? | default [])
             if not ($tc | is-empty) {
-                $tool_deltas = ($tool_deltas | append $tc)
+                let normalized = ($tc | each { |it|
+                    if ($it.index? | default null) == null {
+                        $it | insert index 0
+                    } else {
+                        $it
+                    }
+                })
+                $tool_deltas = ($tool_deltas | append $normalized)
             }
         }
 
@@ -644,7 +651,7 @@ def run_agent [
         # Check for API error if nothing was received
         if ($turn_content | is-empty) and ($turn_reasoning | is-empty) and ($tool_deltas | is-empty) and (not ($stream_lines | is-empty)) {
             let err_raw = ($stream_lines | str join "\n")
-            print -e $"\n\e[31m[Ken Error]\e[0m Request to ($chat_url) failed:\n($err_raw)"
+            print -e $"\n(ansi red_bold)[Ken Error](ansi reset) Request to ($chat_url) failed:\n($err_raw)"
             return
         }
 
@@ -655,7 +662,8 @@ def run_agent [
                 let id = ($d | get -o id | compact | first | default "call_0")
                 let name = ($d | get -o function.name | compact | str join "")
                 let args_str = ($d | get -o function.arguments | compact | str join "")
-                {
+                let extra = ($d | get -o extra_content | compact | first | default null)
+                mut tc_obj = {
                     id: $id
                     type: "function"
                     function: {
@@ -663,6 +671,10 @@ def run_agent [
                         arguments: $args_str
                     }
                 }
+                if $extra != null {
+                    $tc_obj = ($tc_obj | insert extra_content $extra)
+                }
+                $tc_obj
             })
 
             $messages = ($messages | append {
@@ -738,7 +750,7 @@ def run_agent [
             $banner_parts = ($banner_parts | append "---")
 
             let line = ($banner_parts | str join " | ")
-            print ("\n\e[2m" + $line + "\e[0m")
+            print $"\n(ansi d)($line)(ansi reset)"
         }
 
         # Save session history
