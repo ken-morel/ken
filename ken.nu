@@ -333,16 +333,61 @@ def get_agent_tools [agent_dir: string] {
         }
 
         # For call_agent: scope available agents strictly to symlinked *.k in this agent's directory
+        # and document each agent and model with clear, unambiguous descriptions
         if $tool_name == "call_agent" {
-            let available_agents = (glob ($agent_dir | path join "*.k") | each { path parse | get stem } | sort)
-            if ($available_agents | is-empty) {
+            let available_k = (glob ($agent_dir | path join "*.k") | sort)
+            if ($available_k | is-empty) {
                 # If no agents are symlinked to this agent, omit call_agent entirely
                 continue
             }
+
+            let available_agents = ($available_k | each { path parse | get stem } | sort)
+
+            # Build detailed documentation for each available agent from its config.nuon
+            let agent_docs = ($available_k | each { |k_path|
+                let a_name = ($k_path | path parse | get stem)
+                let a_dir = (try { $k_path | path expand } catch { "" })
+                let conf_file = ($a_dir | path join "config.nuon")
+                let a_desc = (if ($conf_file | path exists) {
+                    try { (open $conf_file).description? | default "" } catch { "" }
+                } else { "" })
+                if not ($a_desc | is-empty) {
+                    $"- ($a_name): ($a_desc)"
+                } else {
+                    $"- ($a_name)"
+                }
+            } | str join "\n")
+
             if ($properties | get -o agent) != null {
-                let p_agent = ($properties.agent | insert enum $available_agents | upsert description $"Target agent to delegate to \(available: ($available_agents | str join ', ')\)")
+                let p_agent = ($properties.agent 
+                    | insert enum $available_agents 
+                    | upsert description $"Target agent to delegate to. Available agents:\n($agent_docs)")
                 $properties = ($properties | upsert agent $p_agent)
             }
+
+            # Enumerate and document available models from root config
+            let root_conf = (load_root_config)
+            mut model_items = []
+            for p in ($root_conf.providers | values) {
+                for m_alias in ($p.models | columns) {
+                    let m_info = ($p.models | get $m_alias)
+                    let m_desc = ($m_info.description? | default $m_info.name)
+                    $model_items = ($model_items | append { alias: $m_alias, desc: $"- ($m_alias): ($m_desc)" })
+                }
+            }
+            let model_aliases = ($model_items | get alias | sort)
+            let model_docs = ($model_items | get desc | str join "\n")
+
+            let cur_m = ($env.KEN_MODEL? | default "caller model")
+            if ($properties | get -o model) != null {
+                let p_model = ($properties.model
+                    | insert enum $model_aliases
+                    | upsert description $"Optional model override. Defaults to inheriting caller's model ($cur_m). Available models:\n($model_docs)")
+                $properties = ($properties | upsert model $p_model)
+            }
+
+            # Both agent and task are required
+            $required = ["agent" "task"]
         }
 
         $tools = ($tools | append {
@@ -359,6 +404,20 @@ def get_agent_tools [agent_dir: string] {
         })
     }
     $tools
+}
+
+def count_text_tokens [text: string] {
+    if ($text | is-empty) { return 0 }
+    let res = (try {
+        http post --max-time 150ms --content-type "application/json" "http://127.0.0.1:6172/tokenize" ({ content: $text } | to json -r)
+    } catch { null })
+    if ($res.tokens? | default null) != null {
+        return ($res.tokens | length)
+    }
+    # Fast fallback estimation: max(words * 1.3, chars / 4)
+    let words = ($text | split words | length)
+    let chars = ($text | str length)
+    [($words * 1.3 | math round | into int), ($chars // 4)] | math max
 }
 
 def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
@@ -398,20 +457,23 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
     } | str join " ")
 
     let t_start = (date now)
-    tty_report $"\n(ansi cyan)[call](ansi reset) ($agent_name)/($fn_name) ($formatted_args)\n"
+    let time_start_str = ($t_start | format date "%H:%M:%S")
+    tty_report $"\n(ansi cyan)[call](ansi reset) ($agent_name)/($fn_name) ($formatted_args) \(at ($time_start_str)\)\n"
     let res = (^nu $tool_path ...$pos_args ...$named_args | complete)
-    let t_dur = ((date now) - $t_start)
+    let t_end = (date now)
+    let t_dur = ($t_end - $t_start)
+    let time_end_str = ($t_end | format date "%H:%M:%S")
 
     if $res.exit_code == 0 {
         let output = (if not ($res.stdout | is-empty) { $res.stdout } else { "(Success with no output)" })
         let n_lines = ($output | lines | length)
-        let n_bytes = ($output | str length | into filesize)
+        let n_tokens = (count_text_tokens $output)
         # Print the entire tool output so the user can inspect intermediate results and context
         tty_report $"($output)\n"
-        tty_report $"(ansi green)[done](ansi reset) ($agent_name)/($fn_name) -> ($n_lines) lines, ($n_bytes) \(took ($t_dur)\)\n\n"
+        tty_report $"(ansi green)[done](ansi reset) ($agent_name)/($fn_name) -> ($n_lines) lines, ($n_tokens) tok \(took ($t_dur) @ ($time_end_str)\)\n\n"
         $output
     } else {
-        tty_report $"(ansi red)[error](ansi reset) ($agent_name)/($fn_name) -> exit ($res.exit_code) \(took ($t_dur)\)\n"
+        tty_report $"(ansi red)[error](ansi reset) ($agent_name)/($fn_name) -> exit ($res.exit_code) \(took ($t_dur) @ ($time_end_str)\)\n"
         if not ($res.stderr | is-empty) { tty_report $"($res.stderr)\n" }
         if not ($res.stdout | is-empty) { tty_report $"($res.stdout)\n" }
         tty_report "\n"
@@ -526,6 +588,7 @@ def run_agent [
     $messages = ($messages | append { role: "user", content: $user_content })
 
     let is_interactive = (is-terminal --stdout) and ($env.TERM? != "dumb") and (not $no_md)
+    let t_run_start = (date now)
     mut final_timings: any = null
     mut final_usage: any = null
 
@@ -763,6 +826,10 @@ def run_agent [
             if $gen_tps > 0 {
                 $banner_parts = ($banner_parts | append $"gen: ($gen_tps) t/s")
             }
+
+            let total_dur = ((date now) - $t_run_start)
+            let time_str = (date now | format date "%H:%M:%S")
+            $banner_parts = ($banner_parts | append $"time: ($total_dur) @ ($time_str)")
 
             # Cost calculation
             let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
@@ -1024,6 +1091,72 @@ def "main prefill" [
             print $"\e[31m[failed to save snapshot]\e[0m"
         }
     }
+}
+
+# Subcommand: raw (Direct completion against any configured model without tools or session overhead)
+def "main raw" [
+    prompt?: string              # Prompt text (or pipe via stdin)
+    --model (-m): string = "l"   # Model alias (defaults to 'l' for fast local extraction)
+    --system (-s): string = ""   # Optional system instructions
+    --max-tokens: int = 1024     # Max output tokens
+    --temp: float = 0.1          # Sampling temperature
+] {
+    let has_stdin = (not (is-terminal --stdin))
+    let piped_input = (if $has_stdin { try { open --raw /dev/stdin } catch { "" } } else { "" })
+    let full_prompt = (if not ($prompt | default "" | is-empty) and not ($piped_input | is-empty) {
+        $"($prompt)\n\n($piped_input)"
+    } else if not ($prompt | default "" | is-empty) {
+        $prompt
+    } else {
+        $piped_input
+    })
+
+    if ($full_prompt | is-empty) {
+        print -e "Error: No prompt provided for raw completion."
+        return
+    }
+
+    load_ken_env
+    let root_conf = (load_root_config)
+    let model_info = (resolve_model_info $model $root_conf)
+    let chat_url = $"($model_info.base_url)/chat/completions"
+
+    mut messages = []
+    if not ($system | is-empty) {
+        $messages = ($messages | append { role: "system", content: $system })
+    }
+    $messages = ($messages | append { role: "user", content: $full_prompt })
+
+    let payload = {
+        model: $model_info.model_name
+        messages: $messages
+        temperature: $temp
+        max_tokens: $max_tokens
+        stream: false
+    }
+
+    let t_start = (date now)
+    let res = (try {
+        mut headers = ["Content-Type" "application/json"]
+        if ($model_info.auth_header? | default "" | is-not-empty) {
+            $headers = ($headers | append ["Authorization" $model_info.auth_header])
+        }
+        http post --headers $headers --content-type "application/json" $chat_url ($payload | to json -r)
+    } catch { |e|
+        return $"Error calling model '($model)': ($e.msg)"
+    })
+
+    let t_dur = ((date now) - $t_start)
+    let time_now = (date now | format date "%H:%M:%S")
+
+    let content = ($res.choices?.0?.message?.content? | default "")
+    if ("/dev/tty" | path exists) {
+        let n_tok = ($res.usage?.completion_tokens? | default (count_text_tokens $content))
+        let n_lines = ($content | lines | length)
+        $"\e[2m[raw/($model)] -> ($n_lines) lines, ($n_tok) tok \(took ($t_dur) @ ($time_now)\)\e[0m\n" | save --append "/dev/tty"
+    }
+
+    $content
 }
 
 # Subcommand: schema (Dump OpenAI tool schema for an agent)

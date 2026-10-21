@@ -1,5 +1,5 @@
 {
     name: "coder"
     description: "Codebase specialist for reading code, ripgrep searching, and verified in-place patching"
-    default_model: "dskc"
+    default_model: "adc"
 }

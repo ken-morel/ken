@@ -1,5 +1,5 @@
 {
     name: "fs"
-    description: "Read-only filesystem inspection and file reading"
+    description: "Filesystem inspection, directory listings, and reading file contents"
     default_model: "l"
 }

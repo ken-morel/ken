@@ -74,18 +74,15 @@ def main [
             $"[lfm] filtering candidate results for '($query)'...\n" | save --append "/dev/tty"
         }
         let lfm_prompt = $"Search results for: ($query)\n\nCandidates:\n($raw_results | str substring 0..6000)\n\nTask: Select and summarize the top ($limit) most relevant findings clearly. Include URLs."
-        let lfm_body = {
-            model: "lfm",
-            messages: [{ role: "user", content: $lfm_prompt }],
-            max_tokens: 500
+        let ken_root = ($env.KEN_ROOT? | default ($env.HOME | path join "ken"))
+        let ken_nu = ($ken_root | path join "ken.nu")
+        let lfm_res = if ($ken_nu | path exists) {
+            ^$ken_nu raw $lfm_prompt -m l --max-tokens 500 | complete
+        } else {
+            ^ken raw $lfm_prompt -m l --max-tokens 500 | complete
         }
-        let lfm_res = (try { http post --content-type application/json http://127.0.0.1:6172/v1/chat/completions $lfm_body } catch { null })
-        if ($lfm_res != null) {
-            let out = $lfm_res.choices.0.message.content
-            if ("/dev/tty" | path exists) {
-                $"[done] search ($source) -> ($out | lines | length) lines\n" | save --append "/dev/tty"
-            }
-            return $out
+        if $lfm_res.exit_code == 0 and not ($lfm_res.stdout | is-empty) {
+            return $lfm_res.stdout
         }
     }
 

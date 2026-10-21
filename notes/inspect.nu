@@ -45,25 +45,17 @@ Extract all content, definitions, theorems, formulas, code, diagrams, and explan
 Be thorough and mathematically precise. Quote relevant formulas, definitions, and rules verbatim without summarizing away essential technical details.
 If the information is not in this note, say 'Not mentioned in this note'. Output clean plain ASCII text."
 
-    let payload = {
-        model: "lfm"
-        messages: [
-            { role: "user", content: $prompt }
-        ]
-        temperature: 0.1
-        max_tokens: 2048
-        stream: false
+    let ken_root = ($env.KEN_ROOT? | default ($env.HOME | path join "ken"))
+    let ken_nu = ($ken_root | path join "ken.nu")
+    let res = if ($ken_nu | path exists) {
+        ^$ken_nu raw $prompt -m l --max-tokens 2048 | complete
+    } else {
+        ^ken raw $prompt -m l --max-tokens 2048 | complete
     }
 
-    let res = (try {
-        http post --content-type "application/json" "http://127.0.0.1:6172/v1/chat/completions" ($payload | to json)
-    } catch { |e|
-        return $"LFM note inspection error: ($e.msg)"
-    })
-
-    try {
-        $res.choices.0.message.content
-    } catch {
-        $"Error reading response: ($res)"
+    if $res.exit_code == 0 {
+        $res.stdout
+    } else {
+        $"LFM note inspection error: ($res.stderr)\n($res.stdout)"
     }
 }

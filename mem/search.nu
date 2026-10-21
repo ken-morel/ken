@@ -31,20 +31,17 @@ Available Stored Memories:
 Instructions:
 Extract and synthesize the exact information or answers answering the query from the memories above. Cite the memory name\(s\). If no memories are relevant to the query, state 'No relevant memories found for: ($query)'. Output concise plain ASCII text."
 
-    let payload = {
-        model: "lfm"
-        messages: [
-            { role: "user", content: $prompt }
-        ]
-        temperature: 0.1
-        max_tokens: 1024
-        stream: false
+    let ken_root = ($env.KEN_ROOT? | default ($env.HOME | path join "ken"))
+    let ken_nu = ($ken_root | path join "ken.nu")
+    let res = if ($ken_nu | path exists) {
+        ^$ken_nu raw $prompt -m l --max-tokens 1024 | complete
+    } else {
+        ^ken raw $prompt -m l --max-tokens 1024 | complete
     }
 
-    let res = (try { http post --content-type "application/json" "http://127.0.0.1:6172/v1/chat/completions" ($payload | to json) } catch { |e| null })
-    if ($res == null) {
-        return "LFM memory search error: connection to local server failed."
+    if $res.exit_code == 0 and not ($res.stdout | is-empty) {
+        $res.stdout
+    } else {
+        "No relevant memories found."
     }
-
-    $res.choices?.0?.message?.content? | default "No relevant memories found."
 }

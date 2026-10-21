@@ -18,7 +18,7 @@ if [[ -n "$ZSH_VERSION" ]]; then
             local prompt="${input_text#*#}"
             zle -I
             local gen_cmd
-            gen_cmd=$(ken cmd.qwen "GENERATE: $prompt" --no-mdc 2>/dev/null)
+            gen_cmd=$(ken cmd.q "GENERATE: $prompt" --no-mdc 2>/dev/null)
             if [[ -n "$gen_cmd" ]]; then
                 BUFFER="$gen_cmd"
                 CURSOR=${#BUFFER}
@@ -33,7 +33,7 @@ if [[ -n "$ZSH_VERSION" ]]; then
             local instruction="${input_text#*#}"
             zle -I
             local gen_cmd
-            gen_cmd=$(ken cmd.qwen "MODIFY: Base command: '${base_cmd%% }' | Instruction: '${instruction## }'" --no-mdc 2>/dev/null)
+            gen_cmd=$(ken cmd.q "MODIFY: Base command: '${base_cmd%% }' | Instruction: '${instruction## }'" --no-mdc 2>/dev/null)
             if [[ -n "$gen_cmd" ]]; then
                 BUFFER="$gen_cmd"
                 CURSOR=${#BUFFER}
@@ -45,7 +45,7 @@ if [[ -n "$ZSH_VERSION" ]]; then
         # 3. Ends with ';' -> Explain command detailly
         elif [[ "$input_text" =~ ';[[:space:]]*$' ]]; then
             zle -I
-            ken cmd.qwen "EXPLAIN: $input_text"
+            ken cmd.q "EXPLAIN: $input_text"
             zle reset-prompt
 
         # 4. Neither format matches -> Bell / do nothing
