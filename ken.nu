@@ -406,6 +406,15 @@ def get_agent_tools [agent_dir: string] {
     $tools
 }
 
+def record_metric [item: record] {
+    let f = ($env.KEN_METRICS_FILE? | default "")
+    if ($f | is-not-empty) and ($f | path exists) {
+        try {
+            $"($item | to json -r)\n" | save --append $f
+        }
+    }
+}
+
 def count_text_tokens [text: string] {
     if ($text | is-empty) { return 0 }
     let res = (try {
@@ -600,6 +609,15 @@ def run_agent [
     mut total_cached_tokens = 0
 
     let cur_session = ($session_id | default "default")
+    let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
+    let is_top_level = ($depth == 0)
+    let metrics_file = if $is_top_level {
+        let f = $"/tmp/ken_metrics_($nu.pid).jsonl"
+        "" | save -f $f
+        $f
+    } else {
+        ($env.KEN_METRICS_FILE? | default "")
+    }
 
     # Export execution context to tools and subagents
     load-env {
@@ -608,6 +626,7 @@ def run_agent [
         KEN_MODEL: $model_alias
         KEN_ROOT: $root
         KEN_DEPTH: ($env.KEN_DEPTH? | default "0")
+        KEN_METRICS_FILE: $metrics_file
     }
 
     # Conversation / tool-calling turns (up to 8)
@@ -797,7 +816,17 @@ def run_agent [
 
             # Cost calculation
             let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
-            let cost_res = (calculate_cost $model_info.pricing $total_prompt_tokens $total_pred_tokens $total_cached_tokens $rate_cfa)
+            let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
+            record_metric {
+                source: $"($agent_name)"
+                model: $model_alias
+                turn: ($turn + 1)
+                prompt_tokens: $prompt_n
+                completion_tokens: $pred_n
+                cached_tokens: $cache_n
+                cost_usd: $cost_res.usd
+                cost_cfa: $cost_res.cfa
+            }
             if not $cost_res.is_free {
                 $banner_parts = ($banner_parts | append $"cost: ($cost_res.label)")
             }
@@ -876,6 +905,37 @@ def run_agent [
 
         # Finished turn
         break
+    }
+
+    # Final grand-total session banner across all turns, child agents, and ken raw calls
+    if $is_top_level and not ($metrics_file | is-empty) and ($metrics_file | path exists) {
+        let metric_rows = (try { open --raw $metrics_file | lines | where ($it | is-not-empty) | each { from json } } catch { [] })
+        if not ($metric_rows | is-empty) {
+            let total_p = ($metric_rows | get prompt_tokens | math sum)
+            let total_c = ($metric_rows | get completion_tokens | math sum)
+            let total_usd = ($metric_rows | get cost_usd | math sum)
+            let total_cfa = ($metric_rows | get cost_cfa | math sum)
+            let total_dur = ((date now) - $t_run_start)
+            let time_str = (date now | format date "%H:%M:%S")
+
+            mut summary_parts = [$"=== ($agent_name).($model_alias) total ==="]
+            $summary_parts = ($summary_parts | append $"all: ($total_p + $total_c) tok \(($total_p) in, ($total_c) out\)")
+            $summary_parts = ($summary_parts | append $"time: ($total_dur) @ ($time_str)")
+            if $total_usd > 0.0 {
+                let u_str = (if $total_usd < 0.0001 { $"$($total_usd | math round -p 6)" } else { $"$($total_usd | math round -p 4)" })
+                let c_str = $"($total_cfa | math round -p 2) CFA"
+                $summary_parts = ($summary_parts | append $"total cost: ($u_str) \(($c_str)\)")
+            } else {
+                $summary_parts = ($summary_parts | append "total cost: $0.0000 (free)")
+            }
+            $summary_parts = ($summary_parts | append "===")
+
+            let summary_line = ($summary_parts | str join " | ")
+            if (is-terminal --stdout) and (not $no_md) {
+                tty_report $"\n(ansi green_bold)($summary_line)(ansi reset)\n"
+            }
+        }
+        try { rm -f $metrics_file }
     }
 }
 
@@ -1169,9 +1229,47 @@ def "main raw" [
 
     let content = ($res.choices?.0?.message?.content? | default "")
     if ("/dev/tty" | path exists) {
-        let n_tok = ($res.usage?.completion_tokens? | default (count_text_tokens $content))
+        let prompt_n = ($res.timings?.prompt_n? | default ($res.usage?.prompt_tokens? | default 0))
+        let pred_n = ($res.timings?.predicted_n? | default ($res.usage?.completion_tokens? | default (count_text_tokens $content)))
+        let cache_n = ($res.timings?.cache_n? | default ($res.usage?.prompt_tokens_details?.cached_tokens? | default 0))
+        let ttft_ms = ($res.timings?.prompt_ms? | default 0 | math round)
+        let gen_tps = ($res.timings?.predicted_per_second? | default 0 | into float | math round -p 1)
         let n_lines = ($content | lines | length)
-        $"\e[2m[raw/($model)] -> ($n_lines) lines, ($n_tok) tok \(took ($t_dur) @ ($time_now)\)\e[0m\n" | save --append "/dev/tty"
+
+        mut raw_parts = [$"[raw/($model)]"]
+        let ctx_str = if $cache_n > 0 {
+            $"ctx: ($prompt_n)+($pred_n) \(($cache_n) cached\)"
+        } else {
+            $"ctx: ($prompt_n)+($pred_n)"
+        }
+        $raw_parts = ($raw_parts | append $ctx_str)
+        if $ttft_ms > 0 {
+            $raw_parts = ($raw_parts | append $"ttft: ($ttft_ms)ms")
+        }
+        if $gen_tps > 0 {
+            $raw_parts = ($raw_parts | append $"gen: ($gen_tps) t/s")
+        }
+        $raw_parts = ($raw_parts | append $"-> ($n_lines) lines, ($pred_n) tok \(took ($t_dur) @ ($time_now)\)")
+
+        let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
+        let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
+        if not $cost_res.is_free {
+            $raw_parts = ($raw_parts | append $"cost: ($cost_res.label)")
+        }
+
+        record_metric {
+            source: "raw"
+            model: $model
+            turn: 1
+            prompt_tokens: $prompt_n
+            completion_tokens: $pred_n
+            cached_tokens: $cache_n
+            cost_usd: $cost_res.usd
+            cost_cfa: $cost_res.cfa
+        }
+
+        let raw_line = ($raw_parts | str join " | ")
+        $"\e[2m($raw_line)\e[0m\n" | save --append "/dev/tty"
     }
 
     $content
