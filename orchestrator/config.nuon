@@ -1,11 +1,5 @@
 {
     name: "orchestrator"
     description: "Central intelligence, task coordination, and general assistance"
-    default_model: "qwen"
-    options: {}
-    models: {
-        lfm: { temperature: 0.1 }
-        qwen: { temperature: 0.6 }
-        dsk: { temperature: 0.6 }
-    }
+    default_model: "q"
 }

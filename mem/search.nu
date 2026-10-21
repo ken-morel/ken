@@ -11,14 +11,14 @@ def main [
         $"\n[mem/search] query: '($query)'\n" | save --append "/dev/tty"
     }
 
-    let files = (ls ($mem_dir | path join "*.md") | default [])
+    let files = (glob ($mem_dir | path join "*.md"))
     if ($files | is-empty) {
         return $"No saved memories found in ($mem_dir)."
     }
 
     let all_memories = ($files | each { |f|
-        let name = ($f.name | path parse | get stem)
-        let body = (open --raw $f.name | str trim)
+        let name = ($f | path parse | get stem)
+        let body = (open --raw $f | str trim)
         $"=== Memory: ($name) ===\n($body)"
     } | str join "\n\n")
 
@@ -29,7 +29,7 @@ Available Stored Memories:
 ($all_memories)
 
 Instructions:
-Extract and synthesize the exact information or answers answering the query from the memories above. Cite the memory name(s). If no memories are relevant to the query, state 'No relevant memories found for: ($query)'. Output concise plain ASCII text."
+Extract and synthesize the exact information or answers answering the query from the memories above. Cite the memory name\(s\). If no memories are relevant to the query, state 'No relevant memories found for: ($query)'. Output concise plain ASCII text."
 
     let payload = {
         model: "lfm"
@@ -41,15 +41,10 @@ Extract and synthesize the exact information or answers answering the query from
         stream: false
     }
 
-    let res = (http post --content-type "application/json" "http://127.0.0.1:6172/v1/chat/completions" ($payload | to json) | complete)
-    if ($res.exit_code != 0) {
-        return $"LFM memory search error: ($res.stderr)"
+    let res = (try { http post --content-type "application/json" "http://127.0.0.1:6172/v1/chat/completions" ($payload | to json) } catch { |e| null })
+    if ($res == null) {
+        return "LFM memory search error: connection to local server failed."
     }
 
-    try {
-        let parsed = ($res.stdout | from json)
-        $parsed.choices.0.message.content
-    } catch {
-        $"Error parsing LFM response: ($res.stdout)"
-    }
+    $res.choices?.0?.message?.content? | default "No relevant memories found."
 }

@@ -37,16 +37,22 @@ def main [
         $"[gen_image] rendering: ($final_prompt | str substring 0..50)...\n" | save --append "/dev/tty"
     }
 
-    let backend = ($env.HOME | path join "ken/media/gen_image.k")
-    mut args = [
-        "--prompt" $final_prompt
-        "--size" $size
-        "--aspect-ratio" $aspect_ratio
-        "--preset" $preset
-    ]
-    if ($neg_prompt | is-not-empty) {
-        $args = ($args | append ["--negative-prompt" $neg_prompt])
+    let backend = (which gen-img | get path.0? | default ($env.HOME | path join ".config" "bin" "gen-img"))
+    if not ($backend | path exists) {
+        return "Error: Image generation backend 'gen-img' not found."
     }
 
-    ^$backend ...$args
+    let out_file = ($env.HOME | path join $"image_(date now | format date '%s').png")
+    let prompt_with_preset = (if not ($preset | is-empty) and ($preset != "photo") {
+        $"($final_prompt), ($preset) style"
+    } else {
+        $final_prompt
+    })
+
+    let res = (^$backend $prompt_with_preset $out_file 1 | complete)
+    if ($res.exit_code == 0) and ($out_file | path exists) {
+        $"Image generated successfully!\nFile: ($out_file)\nPrompt: ($prompt_with_preset)"
+    } else {
+        $"Image generation failed: ($res.stderr)\n($res.stdout)"
+    }
 }

@@ -1,11 +1,5 @@
 {
     name: "code"
     description: "Python execution, mathematical calculation, and script evaluation"
-    default_model: "qwen"
-    options: {}
-    models: {
-        lfm: { temperature: 0.1 }
-        qwen: { temperature: 0.2 }
-        dsk: { temperature: 0.2 }
-    }
+    default_model: "q"
 }

@@ -9,14 +9,14 @@ def main [] {
         $"\n[mem/list] checking memories in ($mem_dir)\n" | save --append "/dev/tty"
     }
 
-    let files = (ls ($mem_dir | path join "*.md") | default [])
+    let files = (glob ($mem_dir | path join "*.md"))
     if ($files | is-empty) {
         return "No saved memories found."
     }
 
     $files | each { |f|
-        let name = ($f.name | path parse | get stem)
-        let first_line = (open --raw $f.name | lines | first 1 | default "" | str substring 0..70)
+        let name = ($f | path parse | get stem)
+        let first_line = (open --raw $f | lines | first 1 | default "" | str substring 0..70)
         $"- ($name): ($first_line)"
     } | str join "\n"
 }

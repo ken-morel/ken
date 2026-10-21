@@ -1,7 +1,5 @@
 {
     name: "sys"
     description: "System metrics, hardware telemetry, time, and desktop notifications"
-    default_model: "lfm"
-    options: {}
-    models: {}
+    default_model: "l"
 }

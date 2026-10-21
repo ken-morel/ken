@@ -14,12 +14,12 @@ def main [] {
 
     $"System Statistics:
 Uptime: ($uptime)
-Load (1, 5, 15m): ($load)
+Load \(1, 5, 15m\): ($load)
 
 Memory:
 ($mem)
 
-Disk (/):
+Disk \(/):
 ($disk)
 
 Temperatures:

@@ -1,16 +1,73 @@
 {
-    default_model: "qwen"
+    default_model: "q"
     default_ctx: 16384
-    options: {}
-    models: {
-        lfm: {
-            temperature: 0.1
+    currency: "USD"
+    rate_to_cfa: 584.0
+
+    providers: {
+        local: {
+            type: "openai"
+            base_url: "http://127.0.0.1:6172/v1"
+            models: {
+                q: {
+                    name: "qwen"
+                    description: "Qwen 2.5 4B Instruct (Local GPU)"
+                    ctx: 16384
+                    pricing: { input: 0.0, output: 0.0, cache_hit: 0.0 }
+                }
+                l: {
+                    name: "lfm"
+                    description: "Liquid Foundation Model 2.5 1.2B (Local GPU)"
+                    ctx: 32768
+                    pricing: { input: 0.0, output: 0.0, cache_hit: 0.0 }
+                }
+                d: {
+                    name: "dsk"
+                    description: "DeepSeek R1 Distill Qwen 7B (Local GPU)"
+                    ctx: 8192
+                    pricing: { input: 0.0, output: 0.0, cache_hit: 0.0 }
+                }
+            }
         }
-        qwen: {
-            temperature: 0.6
+
+        deepseek: {
+            type: "openai"
+            base_url: "https://api.deepseek.com"
+            api_key_env: "DEEPSEEK_API_KEY"
+            models: {
+                dskc: {
+                    name: "deepseek-chat"
+                    description: "DeepSeek V3 Chat (Cloud)"
+                    ctx: 65536
+                    pricing: { input: 0.14, output: 0.28, cache_hit: 0.014 }
+                }
+                dskr: {
+                    name: "deepseek-reasoner"
+                    description: "DeepSeek R1 Reasoning (Cloud)"
+                    ctx: 65536
+                    pricing: { input: 0.55, output: 2.19, cache_hit: 0.14 }
+                }
+            }
         }
-        dsk: {
-            temperature: 0.6
+
+        google: {
+            type: "openai"
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+            api_key_env: "GEMINI_API_KEY"
+            models: {
+                gf: {
+                    name: "gemini-3-flash-preview"
+                    description: "Gemini 3 Flash Preview (Google AI Studio)"
+                    ctx: 1048576
+                    pricing: { input: 0.0, output: 0.0, cache_hit: 0.0 }
+                }
+                gp: {
+                    name: "gemini-3.1-pro-preview"
+                    description: "Gemini 3.1 Pro Preview (Google AI Studio)"
+                    ctx: 1048576
+                    pricing: { input: 1.25, output: 5.0, cache_hit: 0.31 }
+                }
+            }
         }
     }
 }

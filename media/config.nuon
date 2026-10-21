@@ -1,7 +1,5 @@
 {
     name: "media"
     description: "Local SD-Turbo image generation and style prompting"
-    default_model: "qwen"
-    options: {}
-    models: {}
+    default_model: "q"
 }

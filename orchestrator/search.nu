@@ -10,6 +10,8 @@ def main [
         $"\n[search] source: ($source) | query: ($query)\n" | save --append "/dev/tty"
     }
 
+    let script_dir = ($env.FILE_PWD? | default ($env.HOME | path join "ken/orchestrator"))
+
     let raw_results = (match $source {
         "weather" => {
             let loc = ($query | str replace -a " " "+")
@@ -49,49 +51,20 @@ def main [
             }
         },
         "arxiv" => {
-            let py_code = "
-import sys, urllib.request, urllib.parse, xml.etree.ElementTree as ET
-q = sys.argv[1]
-url = f'http://export.arxiv.org/api/query?search_query=all:{urllib.parse.quote_plus(q)}&max_results=8'
-try:
-    with urllib.request.urlopen(url, timeout=10) as r: root = ET.fromstring(r.read())
-    ns = {'atom': 'http://www.w3.org/2005/Atom'}
-    entries = root.findall('atom:entry', ns)
-    for i, e in enumerate(entries, 1):
-        title = ' '.join(e.find('atom:title', ns).text.split())
-        authors = ', '.join([a.find('atom:name', ns).text for a in e.findall('atom:author', ns) if a.find('atom:name', ns) is not None])
-        link = e.find('atom:id', ns).text.strip()
-        summary = ' '.join(e.find('atom:summary', ns).text.split())[:350]
-        print(f'[{i}] {title}\nAuthors: {authors}\nURL: {link}\nSummary: {summary}\n')
-except Exception as err:
-    print(f'Error: {err}')
-"
-            python3 -c $py_code $query
+            let arxiv_script = ($script_dir | path join "search_arxiv.py")
+            if ($arxiv_script | path exists) {
+                ^python3 $arxiv_script $query ($limit | into string) | complete | get stdout
+            } else {
+                $"Error: search_arxiv.py not found in ($script_dir)"
+            }
         },
         _ => {
-            # Web search via DDG Lite (fetches 10 results)
-            let py_code = "
-import sys, re, html, urllib.request, urllib.parse
-query = sys.argv[1]
-url = 'https://lite.duckduckgo.com/lite/'
-data = urllib.parse.urlencode({'q': query}).encode('utf-8')
-req = urllib.request.Request(url, data=data, headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)'})
-try:
-    with urllib.request.urlopen(req, timeout=10) as resp: body = resp.read().decode('utf-8', errors='ignore')
-    matches = re.findall(r'<a[^>]+href=[\'\"]([^\'\"]+)[\'\"][^>]+class=[\'\"]result-link[\'\"][^>]*>(.*?)</a>', body, re.DOTALL)
-    snippets = re.findall(r'class=[\'\"]result-snippet[\'\"][^>]*>(.*?)</td>', body, re.DOTALL)
-    def clean(t): return html.unescape(re.sub(r'<[^>]+>', '', t)).strip()
-    results = []
-    for i in range(min(10, len(matches))):
-        raw_url, title_raw = matches[i]
-        link = urllib.parse.parse_qs(urllib.parse.urlparse(raw_url).query).get('uddg', [raw_url])[0] if 'duckduckgo.com/l/' in raw_url else raw_url
-        title, snip = clean(title_raw), clean(snippets[i]) if i < len(snippets) else ''
-        results.append(f'[{i+1}] {title}\nURL: {link}\n{snip}')
-    print('\n\n'.join(results) if results else 'No results found.')
-except Exception as e:
-    print(f'Error: {e}')
-"
-            python3 -c $py_code $query
+            let web_script = ($script_dir | path join "search_web.py")
+            if ($web_script | path exists) {
+                ^python3 $web_script $query ($limit | into string) | complete | get stdout
+            } else {
+                $"Error: search_web.py not found in ($script_dir)"
+            }
         }
     })
 

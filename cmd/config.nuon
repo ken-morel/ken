@@ -1,11 +1,5 @@
 {
     name: "cmd"
     description: "Zsh command generation & explanation specialist for Arch Linux"
-    default_model: "qwen"
-    options: {}
-    models: {
-        lfm: { temperature: 0.1 }
-        qwen: { temperature: 0.3 }
-        dsk: { temperature: 0.3 }
-    }
+    default_model: "q"
 }

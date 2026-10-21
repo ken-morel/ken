@@ -1,7 +1,5 @@
 {
     name: "mail"
     description: "Email search, viewing, and message management"
-    default_model: "qwen"
-    options: {}
-    models: {}
+    default_model: "q"
 }

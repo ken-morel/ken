@@ -1,7 +1,5 @@
 {
     name: "fs"
     description: "Read-only filesystem inspection and file reading"
-    default_model: "lfm"
-    options: {}
-    models: {}
+    default_model: "l"
 }
