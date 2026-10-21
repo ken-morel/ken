@@ -1,16 +1,17 @@
 #!/usr/bin/env nu
 
-# List the latest emails using notmuch
+# List the latest emails using notmuch with optional pagination
 def main [
     --limit (-n): int = 10       # Number of emails to list
+    --offset (-o): int = 0       # Number of emails to skip for pagination (e.g. 5 to view 6-10)
     --query (-q): string = "*"   # Search query or filter
     --unread (-u)                # Filter only unread messages
 ] {
     let q = if $unread { $"tag:unread ($query)" } else { $query }
     if ("/dev/tty" | path exists) {
-        $"\n[mail/list] query: '($q)' | limit: ($limit)\n" | save --append "/dev/tty"
+        $"\n[mail/list] query: '($q)' | limit: ($limit) | offset: ($offset)\n" | save --append "/dev/tty"
     }
-    let res = (^notmuch search --sort=newest-first --limit=($limit | into string) $q | complete)
+    let res = (^notmuch search --sort=newest-first --offset=($offset | into string) --limit=($limit | into string) $q | complete)
     if ($res.exit_code == 0) {
         $res.stdout
     } else {
