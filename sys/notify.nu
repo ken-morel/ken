@@ -6,10 +6,6 @@ def main [
     body: string = ""         # Notification body text
     --urgency: string = "normal" # Urgency level (low, normal, critical)
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[sys/notify] ($summary): ($body)\n" | save --append "/dev/tty"
-    }
-
     let args = if ($body | is-empty) {
         [-u $urgency $summary]
     } else {

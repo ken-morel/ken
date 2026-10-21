@@ -5,10 +5,6 @@ def main [
     id: string             # Thread ID (e.g. 'thread:0000000000003cbb'), message ID, or query
     --raw (-r)             # Output raw MIME source without parsing
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[mail/read] ID: ($id)\n" | save --append "/dev/tty"
-    }
-
     if $raw {
         return (^notmuch show --format=raw $id)
     }

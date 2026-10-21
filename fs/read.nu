@@ -7,9 +7,6 @@ def main [
     --offset: int = 1         # Starting line offset (1-indexed)
 ] {
     let target = ($path | path expand)
-    if ("/dev/tty" | path exists) {
-        $"\n[fs/read] reading: ($target)\n" | save --append "/dev/tty"
-    }
 
     if not ($target | path exists) {
         return $"Error: file '($path)' not found."

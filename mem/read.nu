@@ -7,11 +7,6 @@ def main [
     let safe_name = ($name | str replace -a -r "[^a-zA-Z0-9_-]+" "_" | str trim -c "_")
     let mem_dir = ($env.HOME | path join ".config" "ken" "_mem")
     let file_path = ($mem_dir | path join $"($safe_name).md")
-
-    if ("/dev/tty" | path exists) {
-        $"\n[mem/read] reading: ($safe_name)\n" | save --append "/dev/tty"
-    }
-
     if not ($file_path | path exists) {
         return $"Memory '($name)' not found. Use 'list' to see available memory keys."
     }

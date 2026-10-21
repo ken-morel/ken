@@ -2,10 +2,6 @@
 
 # Get system statistics (CPU, RAM, disk, temperatures, load, uptime)
 def main [] {
-    if ("/dev/tty" | path exists) {
-        $"\n[sys/info] gathering system metrics\n" | save --append "/dev/tty"
-    }
-
     let uptime = (^uptime -p | str trim)
     let load = (open /proc/loadavg | split row " " | slice 0..2 | str join ", ")
     let cpu_model = (try {

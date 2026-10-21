@@ -4,10 +4,6 @@
 def main [
     code: string # Python code snippet to execute
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[code/py] executing python snippet\n" | save --append "/dev/tty"
-    }
-
     let runner = '
 import ast, io, sys
 from contextlib import redirect_stdout

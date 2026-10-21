@@ -22,12 +22,6 @@ def main [
             }
         }
     }
-
-    if ("/dev/tty" | path exists) {
-        let base = ($target_file | path basename)
-        $"\n[notes/read] reading ($base)\n" | save --append "/dev/tty"
-    }
-
     let all_lines = (open --raw $target_file | lines)
     if ($section | is-empty) {
         let selected = ($all_lines | slice 0..$lines)

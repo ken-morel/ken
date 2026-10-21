@@ -5,10 +5,6 @@ def main [
     --query (-q): string         # Natural language search query or keywords
     --limit (-n): int = 5        # Number of emails to inspect
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[mail/search] query: '($query)' | inspecting top ($limit) emails...\n" | save --append "/dev/tty"
-    }
-
     # Find matching threads
     let threads_res = (^notmuch search --sort=newest-first --limit=($limit | into string) $query | complete)
     let thread_lines = ($threads_res.stdout | lines | where ($it | is-not-empty))
@@ -26,11 +22,6 @@ def main [
     }
 
     let cand_str = ($candidates | str join "\n")
-
-    # Run through LFM to distill and answer the query based on the emails
-    if ("/dev/tty" | path exists) {
-        $"[lfm] synthesizing answers from matching emails...\n" | save --append "/dev/tty"
-    }
 
     let lfm_prompt = $"User question about emails: ($query)\n\nFound Email Threads:\n($cand_str)\n\nTask: State the most relevant emails found, their thread IDs, and concise summary answering the question."
     let ken_root = ($env.KEN_ROOT? | default ($env.HOME | path join "ken"))

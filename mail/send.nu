@@ -9,10 +9,6 @@ def main [
     --from (-f): string = ""    # Sender email address override
     --cc (-c): string = ""      # CC recipient
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[mail/send] to: ($to) | subject: ($subject) | account: ($account)\n" | save --append "/dev/tty"
-    }
-
     let sender = if ($from | is-empty) {
         match $account {
             "engon" => "me@engon.cm"

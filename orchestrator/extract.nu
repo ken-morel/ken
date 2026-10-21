@@ -5,10 +5,6 @@ def main [
     --target (-t): string        # Web URL (http/https) or local file path
     --query (-q): string = ""    # Specific information, question, or data to extract
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[extract] target: ($target) | query: ($query)\n" | save --append "/dev/tty"
-    }
-
     let raw_text = (if ($target | str starts-with "http://") or ($target | str starts-with "https://") {
         let cha_res = (^cha $target -d -M | complete)
         if ($cha_res.exit_code == 0) and ($cha_res.stdout | is-not-empty) {
@@ -28,9 +24,6 @@ def main [
 
     # If query is provided, pipe through LFM to extract only the target information
     if ($query | is-not-empty) {
-        if ("/dev/tty" | path exists) {
-            $"[lfm] extracting target information from ($raw_text | str length) chars...\n" | save --append "/dev/tty"
-        }
         let lfm_prompt = $"Document content:\n($raw_text | str substring 0..8000)\n\nQuestion/Goal: ($query)\nExtract the exact, concise answer based strictly on the text."
         let ken_root = ($env.KEN_ROOT? | default ($env.HOME | path join "ken"))
         let ken_nu = ($ken_root | path join "ken.nu")

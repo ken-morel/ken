@@ -7,10 +7,6 @@ def main [
     --aspect_ratio: string = "square" # square, landscape, portrait
     --preset: string = "photo"   # photo, illustration, anime, cinematic, doodle, pixel_art
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[gen_image] enriching visual description with lfm...\n" | save --append "/dev/tty"
-    }
-
     # Use LFM to expand description into rich visual details and negative prompt
     let lfm_prompt = $"Turn this image description into a detailed diffusion visual prompt and negative prompt.\nInput: ($description)\nOutput format:\nPROMPT: <detailed prompt>\nNEGATIVE: <unwanted elements>"
     let ken_root = ($env.KEN_ROOT? | default ($env.HOME | path join "ken"))
@@ -33,11 +29,6 @@ def main [
             }
         }
     }
-
-    if ("/dev/tty" | path exists) {
-        $"[gen_image] rendering: ($final_prompt)\n" | save --append "/dev/tty"
-    }
-
     let backend = (which gen-img | get path.0? | default ($env.HOME | path join ".config" "bin" "gen-img"))
     if not ($backend | path exists) {
         return "Error: Image generation backend 'gen-img' not found."

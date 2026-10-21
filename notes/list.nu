@@ -8,11 +8,6 @@ def main [
     if not ($notes_dir | path exists) {
         return $"Notes directory not found at ($notes_dir)"
     }
-
-    if ("/dev/tty" | path exists) {
-        $"\n[notes/list] indexing ($notes_dir)\n" | save --append "/dev/tty"
-    }
-
     let typ_files = (glob ($notes_dir | path join "**" "*.typ"))
     let md_files = (glob ($notes_dir | path join "**" "*.md"))
     let all_files = ($typ_files | append $md_files | sort)

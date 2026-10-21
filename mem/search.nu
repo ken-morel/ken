@@ -6,11 +6,6 @@ def main [
 ] {
     let mem_dir = ($env.HOME | path join ".config" "ken" "_mem")
     mkdir $mem_dir
-
-    if ("/dev/tty" | path exists) {
-        $"\n[mem/search] query: '($query)'\n" | save --append "/dev/tty"
-    }
-
     let files = (glob ($mem_dir | path join "*.md"))
     if ($files | is-empty) {
         return $"No saved memories found in ($mem_dir)."

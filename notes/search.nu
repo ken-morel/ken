@@ -9,11 +9,6 @@ def main [
     if not ($notes_dir | path exists) {
         return $"Notes directory not found at ($notes_dir)"
     }
-
-    if ("/dev/tty" | path exists) {
-        $"\n[notes/search] query: '($query)'\n" | save --append "/dev/tty"
-    }
-
     let res = (^rg -i -n -C 1 -m ($limit | into string) --glob "*.typ" --glob "*.md" --glob "!template.typ" $query $notes_dir | complete)
     if ($res.exit_code == 0) and not ($res.stdout | is-empty) {
         $res.stdout | str replace -a $notes_dir "~"

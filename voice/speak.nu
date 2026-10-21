@@ -5,10 +5,6 @@ def main [
     text: string                # Text message to speak aloud
     --speed (-s): string = "1.0" # Speech speed multiplier (e.g. 1.0, 1.2)
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[voice/speak] speaking: ($text)\n" | save --append "/dev/tty"
-    }
-
     let script_dir = ($env.FILE_PWD? | default ($env.PWD | path join "voice"))
     let runner = ($script_dir | path join "readaloud.sh")
     

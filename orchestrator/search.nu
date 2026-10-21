@@ -6,10 +6,6 @@ def main [
     --source (-s): string = "web" # Source: web (default), wiki, arxiv, gh, pkg, weather
     --limit (-n): int = 5        # Max results to return
 ] {
-    if ("/dev/tty" | path exists) {
-        $"\n[search] source: ($source) | query: ($query)\n" | save --append "/dev/tty"
-    }
-
     let script_dir = ($env.FILE_PWD? | default ($env.HOME | path join "ken/orchestrator"))
 
     let raw_results = (match $source {
@@ -70,9 +66,6 @@ def main [
 
     # For web, wiki, and arxiv: run candidate results through LFM to filter noise and rank top matches
     if ($source in ["web", "wiki", "arxiv"]) and ($raw_results | str length) > 100 {
-        if ("/dev/tty" | path exists) {
-            $"[lfm] filtering candidate results for '($query)'...\n" | save --append "/dev/tty"
-        }
         let lfm_prompt = $"Search results for: ($query)\n\nCandidates:\n($raw_results | str substring 0..6000)\n\nTask: Select and summarize the top ($limit) most relevant findings clearly. Include URLs."
         let ken_root = ($env.KEN_ROOT? | default ($env.HOME | path join "ken"))
         let ken_nu = ($ken_root | path join "ken.nu")
@@ -84,10 +77,6 @@ def main [
         if $lfm_res.exit_code == 0 and not ($lfm_res.stdout | is-empty) {
             return $lfm_res.stdout
         }
-    }
-
-    if ("/dev/tty" | path exists) {
-        $"[done] search ($source) -> ($raw_results | lines | length) lines\n" | save --append "/dev/tty"
     }
     $raw_results
 }

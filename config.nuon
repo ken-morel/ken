@@ -1,4 +1,5 @@
 {
+    default_agent: "orchestrator"
     default_model: "q"
     default_ctx: 16384
     currency: "USD"

@@ -10,11 +10,6 @@ def main [
     let mem_dir = ($env.HOME | path join ".config" "ken" "_mem")
     mkdir $mem_dir
     let file_path = ($mem_dir | path join $"($safe_name).md")
-
-    if ("/dev/tty" | path exists) {
-        $"\n[mem/write] saving to ($safe_name).md\n" | save --append "/dev/tty"
-    }
-
     $content | save -f $file_path
     $"Saved memory '($safe_name)' successfully."
 }

@@ -1,21 +1,32 @@
 #!/usr/bin/env nu
 # Ken - Local Agentic Assistant in pure Nushell
 
-const LLAMA_URL = "http://127.0.0.1:6172/v1/chat/completions"
-const TOKENIZE_URL = "http://127.0.0.1:6172/tokenize"
-const SLOTS_URL = "http://127.0.0.1:6172/slots"
-const DEFAULT_MODEL = "q"
-const DEFAULT_CTX = 16384
-
 def get_ken_root [] {
     if not ($env.KEN_ROOT? | default "" | is-empty) and ($env.KEN_ROOT | path exists) {
         return $env.KEN_ROOT
+    }
+    let script_dir = ($env.FILE_PWD? | default "")
+    if not ($script_dir | is-empty) and ($script_dir | path exists) {
+        return $script_dir
     }
     let home_ken = ($env.HOME | path join "ken")
     if ($home_ken | path exists) {
         return $home_ken
     }
-    $env.FILE_PWD? | default ($env.HOME | path join "ken")
+    $env.PWD
+}
+
+def get_local_url [endpoint: string = "", root_conf?: record] {
+    let rc = if $root_conf != null { $root_conf } else { load_root_config }
+    let base = ($rc.providers?.local?.base_url? | default "http://127.0.0.1:6172/v1")
+    let p = ($base | url parse)
+    let port_str = (if ($p.port? | default "" | is-not-empty) { $":($p.port)" } else { "" })
+    let host = $"($p.scheme)://($p.host)($port_str)"
+    match $endpoint {
+        "slots" => $"($host)/slots"
+        "tokenize" => $"($host)/tokenize"
+        _ => $"($base)/chat/completions"
+    }
 }
 
 def --env load_ken_env [] {
@@ -142,8 +153,10 @@ def calculate_cost [pricing: record, prompt_tokens: int, completion_tokens: int,
 }
 
 def get_known_models [] {
+    let rc = (load_root_config)
+    let local_base = ($rc.providers?.local?.base_url? | default "http://127.0.0.1:6172/v1")
     let from_api = (try {
-        http get --max-time 1sec "http://127.0.0.1:6172/v1/models" | get data.id
+        http get --max-time 1sec $"($local_base)/models" | get data.id
     } catch { [] })
     if not ($from_api | is-empty) {
         return $from_api
@@ -154,11 +167,20 @@ def get_known_models [] {
         return (open $ini_path | lines | where ($it | str starts-with "[") and ($it != "[*]") | each { str replace "[" "" | str replace "]" "" | str trim })
     }
 
-    [$DEFAULT_MODEL]
+    if not ($rc.default_model | is-empty) {
+        return [$rc.default_model]
+    }
+    []
 }
 
 def get_model_ctx [model: string] {
-    let models_res = (try { http get --max-time 1sec "http://127.0.0.1:6172/v1/models" } catch { null })
+    let rc = (load_root_config)
+    let m_info = (try { resolve_model_info $model $rc } catch { null })
+    if $m_info != null and ($m_info.ctx? | default null) != null {
+        return ($m_info.ctx | into int)
+    }
+    let local_base = ($rc.providers?.local?.base_url? | default "http://127.0.0.1:6172/v1")
+    let models_res = (try { http get --max-time 1sec $"($local_base)/models" } catch { null })
     if $models_res != null {
         let m_data = ($models_res.data? | default [] | where id == $model | first)
         let ctx = ($m_data.meta?.n_ctx? | default null)
@@ -171,7 +193,7 @@ def get_model_ctx [model: string] {
             }
         }
     }
-    $DEFAULT_CTX
+    ($rc.default_ctx? | default 8192)
 }
 
 def get_session_dir [] {
@@ -186,8 +208,8 @@ def get_metrics_dir [] {
     $d
 }
 
-def get_slots_dir [model: string = $DEFAULT_MODEL] {
-    let d = ($env.HOME | path join ".cache" $"($model)-server" "slots")
+def get_slots_dir [model: string = ""] {
+    let d = ($env.HOME | path join ".cache" "ken" "slots")
     mkdir $d
     $d
 }
@@ -204,14 +226,34 @@ def load_root_config [] {
     let ken_root = (get_ken_root)
     let conf_path = ($ken_root | path join "config.nuon")
     mut root_conf = {
-        default_model: $DEFAULT_MODEL
-        default_ctx: $DEFAULT_CTX
+        default_agent: ""
+        default_model: ""
+        default_ctx: 8192
         options: {}
         models: {}
+        providers: {}
     }
     if ($conf_path | path exists) {
         let loaded = (try { open $conf_path } catch { {} })
         $root_conf = ($root_conf | merge ($loaded | default {}))
+    }
+    # Auto-detect default_agent if empty
+    if ($root_conf.default_agent | is-empty) {
+        let candidate_agents = (try {
+            ls $ken_root | where type == dir and (not ($it.name | path basename | str starts-with ".")) and ($it.name | path basename) != "bin" | get name | each { path basename }
+        } catch { [] })
+        if not ($candidate_agents | is-empty) {
+            $root_conf = ($root_conf | upsert default_agent ($candidate_agents | first))
+        }
+    }
+    # Auto-detect default_model if empty
+    if ($root_conf.default_model | is-empty) {
+        let first_model = (try {
+            $root_conf.providers | values | get 0.models | columns | get 0
+        } catch { "" })
+        if not ($first_model | is-empty) {
+            $root_conf = ($root_conf | upsert default_model $first_model)
+        }
     }
     $root_conf
 }
@@ -265,8 +307,10 @@ def resolve_model_params [agent_conf: record, model_id: string] {
 # Parse model specifier dynamically: [session][agent.]<model> or [session][agent] or [session][model]
 def parse_spec [spec_str: string] {
     let raw = ($spec_str | default "" | str trim)
+    let root_conf = (load_root_config)
+    let def_agent = ($root_conf.default_agent? | default "orchestrator")
     if ($raw | is-empty) {
-        return { session: null, agent: "orchestrator", model: null, model_explicit: false }
+        return { session: null, agent: $def_agent, model: null, model_explicit: false }
     }
 
     let p_sess = ($raw | parse -r '^(?<session>\d+)?(?<rest>.*)$' | first)
@@ -284,28 +328,29 @@ def parse_spec [spec_str: string] {
 
     # 2. Check if name matches an existing agent folder in ken
     let agent_path = ($ken_root | path join $rest)
-    if ($agent_path | path exists) {
+    if ($agent_path | path exists) and ($agent_path | path type) == "dir" {
         return { session: $session, agent: $rest, model: null, model_explicit: false }
     }
 
     # 3. Model alias (e.g. q, l, d, dskc, dskr, gf, gp)
-    { session: $session, agent: "orchestrator", model: $rest, model_explicit: true }
+    { session: $session, agent: $def_agent, model: $rest, model_explicit: true }
 }
 
 def resolve_agent_dir [agent: string] {
     let root = (get_ken_root)
-    if $agent in ["orchestrator" "ken"] {
-        let p = ($root | path join "orchestrator")
-        if ($p | path exists) { $p } else { ($root | path join "ken") }
-    } else {
-        $root | path join $agent
+    let root_conf = (load_root_config)
+    let def_agent = ($root_conf.default_agent? | default "orchestrator")
+    if $agent in ["ken" $def_agent] {
+        let p = ($root | path join $def_agent)
+        if ($p | path exists) { return $p }
     }
+    $root | path join $agent
 }
 
 # Introspect Nushell tools in agent directory and generate OpenAI schemas
 def get_agent_tools [agent_dir: string] {
     if not ($agent_dir | path exists) { return [] }
-    let nu_files = (glob ($agent_dir | path join "*.nu") | sort)
+    let nu_files = (glob ($agent_dir | path join "*.nu") | where { |it| ($it | path parse | get stem) != "call_agent" } | sort)
     
     mut tools = []
     for f in $nu_files {
@@ -338,64 +383,6 @@ def get_agent_tools [agent_dir: string] {
             }
         }
 
-        # For call_agent: scope available agents strictly to symlinked *.k in this agent's directory
-        # and document each agent and model with clear, unambiguous descriptions
-        if $tool_name == "call_agent" {
-            let available_k = (glob ($agent_dir | path join "*.k") | sort)
-            if ($available_k | is-empty) {
-                # If no agents are symlinked to this agent, omit call_agent entirely
-                continue
-            }
-
-            let available_agents = ($available_k | each { path parse | get stem } | sort)
-
-            # Build detailed documentation for each available agent from its config.nuon
-            let agent_docs = ($available_k | each { |k_path|
-                let a_name = ($k_path | path parse | get stem)
-                let a_dir = (try { $k_path | path expand } catch { "" })
-                let conf_file = ($a_dir | path join "config.nuon")
-                let a_desc = (if ($conf_file | path exists) {
-                    try { (open $conf_file).description? | default "" } catch { "" }
-                } else { "" })
-                if not ($a_desc | is-empty) {
-                    $"- ($a_name): ($a_desc)"
-                } else {
-                    $"- ($a_name)"
-                }
-            } | str join "\n")
-
-            if ($properties | get -o agent) != null {
-                let p_agent = ($properties.agent 
-                    | insert enum $available_agents 
-                    | upsert description $"Target agent to delegate to. Available agents:\n($agent_docs)")
-                $properties = ($properties | upsert agent $p_agent)
-            }
-
-            # Enumerate and document available models from root config
-            let root_conf = (load_root_config)
-            mut model_items = []
-            for p in ($root_conf.providers | values) {
-                for m_alias in ($p.models | columns) {
-                    let m_info = ($p.models | get $m_alias)
-                    let m_desc = ($m_info.description? | default $m_info.name)
-                    $model_items = ($model_items | append { alias: $m_alias, desc: $"- ($m_alias): ($m_desc)" })
-                }
-            }
-            let model_aliases = ($model_items | get alias | sort)
-            let model_docs = ($model_items | get desc | str join "\n")
-
-            let cur_m = ($env.KEN_MODEL? | default "caller model")
-            if ($properties | get -o model) != null {
-                let p_model = ($properties.model
-                    | insert enum $model_aliases
-                    | upsert description $"Optional model override. Defaults to inheriting caller's model ($cur_m). Available models:\n($model_docs)")
-                $properties = ($properties | upsert model $p_model)
-            }
-
-            # Both agent and task are required
-            $required = ["agent" "task"]
-        }
-
         $tools = ($tools | append {
             type: "function"
             function: {
@@ -409,7 +396,145 @@ def get_agent_tools [agent_dir: string] {
             }
         })
     }
+
+    # Auto-generate call_agent tool if agent has callable subagents (via *.k symlinks or subagents in config.nuon)
+    let available_k = (glob ($agent_dir | path join "*.k") | sort)
+    let agent_conf = (load_agent_config $agent_dir)
+    let subagents_cfg = ($agent_conf.subagents? | default [])
+    let k_agents = ($available_k | each { path parse | get stem })
+    let available_agents = ($k_agents | append $subagents_cfg | uniq | sort)
+
+    if not ($available_agents | is-empty) {
+        let agent_docs = ($available_agents | each { |a_name|
+            let a_dir = (resolve_agent_dir $a_name)
+            let conf_file = ($a_dir | path join "config.nuon")
+            let a_desc = (if ($conf_file | path exists) {
+                try { (open $conf_file).description? | default "" } catch { "" }
+            } else { "" })
+            if not ($a_desc | is-empty) {
+                $"- ($a_name): ($a_desc)"
+            } else {
+                $"- ($a_name)"
+            }
+        } | str join "\n")
+
+        let root_conf = (load_root_config)
+        mut model_items = []
+        for p in ($root_conf.providers | values) {
+            for m_alias in ($p.models | columns) {
+                let m_info = ($p.models | get $m_alias)
+                let m_desc = ($m_info.description? | default $m_info.name)
+                $model_items = ($model_items | append { alias: $m_alias, desc: $"- ($m_alias): ($m_desc)" })
+            }
+        }
+        let model_aliases = ($model_items | get alias | sort)
+        let model_docs = ($model_items | get desc | str join "\n")
+        let cur_m = ($env.KEN_MODEL? | default ($root_conf.default_model))
+
+        $tools = ($tools | append {
+            type: "function"
+            function: {
+                name: "call_agent"
+                description: "Delegate a specialized task to a domain specialist agent"
+                parameters: {
+                    type: "object"
+                    properties: {
+                        agent: {
+                            type: "string"
+                            enum: $available_agents
+                            description: $"Target agent to delegate to. Available agents:\n($agent_docs)"
+                        }
+                        task: {
+                            type: "string"
+                            description: "The specific prompt, instruction, or task for the specialist agent"
+                        }
+                        model: {
+                            type: "string"
+                            enum: $model_aliases
+                            description: $"Optional model override. Defaults to inheriting caller's model ($cur_m). Available models:\n($model_docs)"
+                        }
+                    }
+                    required: ["agent", "task"]
+                }
+            }
+        })
+    }
+
     $tools
+}
+
+def do_call_agent [
+    agent: string
+    task: string
+    model: string = ""
+    caller_agent?: string
+] {
+    let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
+    if $depth >= 3 {
+        return "Error: Maximum agent recursion depth (3) reached. Synthesize final answer."
+    }
+
+    let ken_root = (get_ken_root)
+    let root_conf = (load_root_config)
+    let def_agent = $root_conf.default_agent
+    let caller_name = (if not ($caller_agent | is-empty) { $caller_agent } else { $env.KEN_AGENT? | default $def_agent })
+    let caller_dir = (resolve_agent_dir $caller_name)
+
+    # Resolve target agent: must exist as <caller_dir>/<agent>.k or be declared in subagents
+    let agent_k = ($caller_dir | path join $"($agent).k")
+    let has_k = ($agent_k | path exists)
+    let caller_conf = (load_agent_config $caller_dir)
+    let allowed_subagents = ($caller_conf.subagents? | default [])
+    let is_allowed = $has_k or ($agent in $allowed_subagents)
+
+    if not $is_allowed {
+        return $"Error: Agent '($agent)' is not available in ($caller_name)."
+    }
+
+    # Resolve target model:
+    # 1. Explicit --model flag from caller
+    # 2. Cloud caller propagates cloud model down
+    # 3. Inherit caller model if supported by target agent
+    # 4. Target default model
+    let target_dir = (resolve_agent_dir $agent)
+    let target_conf = (load_agent_config $target_dir)
+
+    let supported_models = ($target_conf.supported_models? | default [])
+    let target_default = ($target_conf.default_model? | default "")
+    let caller_model = ($env.KEN_MODEL? | default "")
+    let is_cloud_caller = ($caller_model | str starts-with "a")
+
+    let chosen_model = if not ($model | is-empty) {
+        $model
+    } else if $is_cloud_caller {
+        $caller_model
+    } else if not ($caller_model | is-empty) and (($supported_models | is-empty) or ($caller_model in $supported_models)) {
+        $caller_model
+    } else if not ($target_default | is-empty) {
+        $target_default
+    } else {
+        ""
+    }
+
+    let target = (if not ($chosen_model | is-empty) { $"($agent).($chosen_model)" } else { $agent })
+    let sess_id = ($env.KEN_SESSION? | default "default")
+    let full_spec = (if $sess_id != "default" { $"($sess_id)($target)" } else { $target })
+    let next_depth = ($depth + 1 | into string)
+
+    let ken_nu = ($ken_root | path join "ken.nu")
+    let res = (with-env { KEN_DEPTH: $next_depth } {
+        if ($ken_nu | path exists) {
+            ^$ken_nu $full_spec $task | complete
+        } else {
+            ^ken $full_spec $task | complete
+        }
+    })
+
+    if $res.exit_code == 0 {
+        $res.stdout
+    } else {
+        $"Error running agent ($agent): ($res.stderr)\n($res.stdout)"
+    }
 }
 
 def record_metric [item: record] {
@@ -481,8 +606,9 @@ def format_duration [dur: duration] {
 
 def count_text_tokens [text: string] {
     if ($text | is-empty) { return 0 }
+    let tok_url = (get_local_url "tokenize")
     let res = (try {
-        http post --max-time 150ms --content-type "application/json" "http://127.0.0.1:6172/tokenize" ({ content: $text } | to json -r)
+        http post --max-time 150ms --content-type "application/json" $tok_url ({ content: $text } | to json -r)
     } catch { null })
     if ($res.tokens? | default null) != null {
         return ($res.tokens | length)
@@ -494,59 +620,116 @@ def count_text_tokens [text: string] {
 }
 
 def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
-    let tool_path = ($agent_dir | path join $"($fn_name).nu")
-    if not ($tool_path | path exists) {
-        return $"Error: Tool '($fn_name)' not found in ($agent_dir)."
-    }
     let args_dict = (try { $args_json | from json } catch { {} })
+    let agent_name = ($agent_dir | path basename)
+    let is_call_agent = ($fn_name in ["call_agent" "call-agent"])
+    let tool_path = ($agent_dir | path join $"($fn_name).nu")
 
-    let tool_info = (try {
-        nu -c $"source '($tool_path)'; scope commands | where name == 'main' | select signatures | to json" | from json | first
-    } catch { null })
+    if not $is_call_agent and not ($tool_path | path exists) {
+        return $"Error: Tool '($fn_name)' not found in agent '($agent_name)'."
+    }
 
-    let sigs = ($tool_info.signatures?.any? | default [])
     mut pos_args = []
     mut named_args = []
 
-    for p in $sigs {
-        let p_name = $p.parameter_name
-        if $p_name == null or $p.parameter_type in ["input" "output"] { continue }
-        if ($args_dict | get -o $p_name) != null {
-            let val = ($args_dict | get $p_name)
-            if $p.parameter_type == "positional" {
-                $pos_args = ($pos_args | append ($val | into string))
-            } else if $p.parameter_type == "switch" {
-                if ($val == true) { $named_args = ($named_args | append $"--($p_name)") }
-            } else {
-                $named_args = ($named_args | append $"--($p_name)" | append ($val | into string))
+    if not $is_call_agent {
+        let tool_info = (try {
+            nu -c $"source '($tool_path)'; scope commands | where name == 'main' | select signatures | to json" | from json | first
+        } catch { null })
+
+        let sigs = ($tool_info.signatures?.any? | default [])
+        for p in $sigs {
+            let p_name = $p.parameter_name
+            if $p_name == null or $p.parameter_type in ["input" "output"] { continue }
+            if ($args_dict | get -o $p_name) != null {
+                let val = ($args_dict | get $p_name)
+                if $p.parameter_type == "positional" {
+                    $pos_args = ($pos_args | append ($val | into string))
+                } else if $p.parameter_type == "switch" {
+                    if ($val == true) { $named_args = ($named_args | append $"--($p_name)") }
+                } else {
+                    $named_args = ($named_args | append $"--($p_name)" | append ($val | into string))
+                }
             }
         }
     }
 
     # Format detailed tool command line
-    let agent_name = ($agent_dir | path basename)
     let formatted_args = ($args_dict | transpose key val | each { |it|
         $"--($it.key) '($it.val)'"
     } | str join " ")
 
+    let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
+    let indent = ("" | fill -c " " -w ($depth * 2))
+
     let t_start = (date now)
     let time_start_str = ($t_start | format date "%H:%M:%S")
-    tty_report $"\n(ansi cyan)[call](ansi reset) ($agent_name)/($fn_name) ($formatted_args) @ ($time_start_str)\n"
-    let res = (^nu $tool_path ...$pos_args ...$named_args | complete)
+    tty_report $"\n($indent){ ($agent_name)/($fn_name) ($formatted_args) @ ($time_start_str)\n"
+
+    # Virtual Slot Management: If calling subagent (call_agent) on a local model,
+    # save active working slot state to SSD so caller KV cache is restored immediately upon return
+    let rc = (load_root_config)
+    let caller_model = ($env.KEN_MODEL? | default $rc.default_model)
+    let is_local_caller = (try {
+        (resolve_model_info $caller_model $rc).is_local
+    } catch { false })
+
+    let slot_backup_name = $"active_depth_($depth)_($caller_model).bin"
+    let slots_url = (get_local_url "slots" $rc)
+    if $is_call_agent and $is_local_caller {
+        let m_info = (resolve_model_info $caller_model $rc)
+        try {
+            http post --content-type "application/json" $"($slots_url)/0?action=save" ({ model: $m_info.model_name, filename: $slot_backup_name } | to json -r)
+        }
+    }
+
+    # Track metrics file lines before tool runs to detect if child model already streamed live to /dev/tty
+    let mf = ($env.KEN_METRICS_FILE? | default "")
+    let metric_lines_before = if ($mf | is-not-empty) and ($mf | path exists) {
+        (try { open --raw $mf | lines | length } catch { 0 })
+    } else { 0 }
+
+    let res = if $is_call_agent {
+        let target_agent = ($args_dict.agent? | default "")
+        let task_str = ($args_dict.task? | default "")
+        let model_str = ($args_dict.model? | default "")
+        let out = (do_call_agent $target_agent $task_str $model_str $agent_name)
+        { stdout: $out, stderr: "", exit_code: 0 }
+    } else {
+        (^nu $tool_path ...$pos_args ...$named_args | complete)
+    }
+
     let t_end = (date now)
     let t_dur = ($t_end - $t_start)
     let time_end_str = ($t_end | format date "%H:%M:%S")
+
+    # Restore caller's working slot after subagent returns
+    if $is_call_agent and $is_local_caller {
+        let m_info = (resolve_model_info $caller_model $rc)
+        try {
+            http post --content-type "application/json" $"($slots_url)/0?action=restore" ({ model: $m_info.model_name, filename: $slot_backup_name } | to json -r)
+        }
+    }
+
+    let metric_lines_after = if ($mf | is-not-empty) and ($mf | path exists) {
+        (try { open --raw $mf | lines | length } catch { 0 })
+    } else { 0 }
+    let child_streamed = ($metric_lines_after > $metric_lines_before)
 
     if $res.exit_code == 0 {
         let output = (if not ($res.stdout | is-empty) { $res.stdout } else { "(Success with no output)" })
         let n_lines = ($output | lines | length)
         let n_tokens = (count_text_tokens $output)
-        # Print the entire tool output so the user can inspect intermediate results and context
-        tty_report $"($output)\n"
-        tty_report $"(ansi green)[done](ansi reset) ($agent_name)/($fn_name) -> ($n_lines)L ($n_tokens)t \((format_duration $t_dur) @ ($time_end_str)\)\n\n"
+        
+        # Only print raw output if child model didn't already stream live to /dev/tty
+        if not $child_streamed {
+            let indented_output = ($output | lines | each { |l| $"($indent)  ($l)" } | str join "\n")
+            tty_report $"($indented_output)\n"
+        }
+        tty_report $"($indent)} ($agent_name)/($fn_name) -> ($n_lines)L ($n_tokens)t \((format_duration $t_dur) @ ($time_end_str)\)\n\n"
         $output
     } else {
-        tty_report $"(ansi red)[error](ansi reset) ($agent_name)/($fn_name) -> exit ($res.exit_code) \((format_duration $t_dur) @ ($time_end_str)\)\n"
+        tty_report $"($indent)} ($agent_name)/($fn_name) ! exit ($res.exit_code) \((format_duration $t_dur) @ ($time_end_str)\)\n"
         if not ($res.stderr | is-empty) { tty_report $"($res.stderr)\n" }
         if not ($res.stdout | is-empty) { tty_report $"($res.stdout)\n" }
         tty_report "\n"
@@ -554,13 +737,18 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
     }
 }
 
-def style_line [text: string, lang: string = "markdown"] {
+def style_line [text: string, lang: string = "markdown", prefix: string = ""] {
     if ($text | is-empty) { return "" }
     let res = ($text | ^bat --plain --paging=never --color=always -l $lang | complete)
-    if $res.exit_code == 0 {
+    let rendered = if $res.exit_code == 0 {
         $res.stdout | str trim -r -c "\n"
     } else {
         $text
+    }
+    if not ($prefix | is-empty) {
+        $rendered | lines | each { |l| $"($prefix)($l)" } | str join "\n"
+    } else {
+        $rendered
     }
 }
 
@@ -618,11 +806,12 @@ def run_agent [
         let snap_exists = ($snapshot_file | path exists)
 
         if $snap_exists {
+            let slots_url = (get_local_url "slots" $root_conf)
             let snap_mtime = (ls $snapshot_file | get 0.modified)
             let agent_mtime = (try { ls $agent_dir | get modified | math max } catch { null })
             if ($agent_mtime == null) or ($snap_mtime >= $agent_mtime) {
                 let res = (try {
-                    http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=restore" ({ model: $model_id, filename: $snap_filename } | to json -r)
+                    http post --content-type "application/json" $"($slots_url)/($assigned_slot)?action=restore" ({ model: $model_id, filename: $snap_filename } | to json -r)
                 } catch { null })
                 if $res != null and ($res.timings?.restore_ms? != null) {
                     $snapshot_restored = true
@@ -645,9 +834,31 @@ def run_agent [
         $messages = ($messages | update 0 { role: "system", content: $system_prompt })
     }
 
-    # Dynamic date tag at the tail of user message (KV cache preservation)
-    let now_str = (date now | format date "%Y-%m-%d %H:%M:%S")
-    let user_text = (if not ($query | is-empty) { $"($query)\n\n[Date: ($now_str)]" } else { $"[Date: ($now_str)]" })
+    let cur_session = ($session_id | default "default")
+    let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
+    let indent = ("" | fill -c " " -w ($depth * 2))
+    let is_top_level = ($depth == 0)
+    let metrics_dir = (get_metrics_dir)
+    let metrics_file = if ($env.KEN_METRICS_FILE? | default "" | is-empty) {
+        let now_ts = (date now | format date "%Y%m%d_%H%M%S")
+        let f = ($metrics_dir | path join $"run_($now_ts)_($nu.pid).jsonl")
+        "" | save -f $f
+        $f
+    } else {
+        $env.KEN_METRICS_FILE
+    }
+
+    # Dynamic date prefix only for top-level user message
+    let now_str = (date now | format date "%Y-%m-%d %H:%M")
+    let user_text = if $is_top_level {
+        if not ($query | is-empty) {
+            $"The current time is ($now_str).\n\n($query)"
+        } else {
+            $"The current time is ($now_str)."
+        }
+    } else {
+        $query
+    }
 
     mut user_content: any = $user_text
     if not ($image_path | is-empty) and ($image_path | path exists) {
@@ -660,30 +871,18 @@ def run_agent [
 
     $messages = ($messages | append { role: "user", content: $user_content })
 
-    let is_interactive = (is-terminal --stdout) and ($env.TERM? != "dumb") and (not $no_md)
+    let has_tty = ("/dev/tty" | path exists)
+    let is_interactive = ($has_tty or (is-terminal --stdout)) and ($env.TERM? != "dumb") and (not $no_md)
     let t_run_start = (date now)
     let time_start_str = ($t_run_start | format date "%H:%M:%S")
 
-    if (is-terminal --stdout) and (not $no_md) {
-        tty_report $"(ansi d)[start] ($agent_name).($model_alias) @ ($time_start_str)(ansi reset)\n"
+    if (not $no_md) {
+        tty_report $"\n($indent)[ ($agent_name).($model_alias) @ ($time_start_str)\n"
     }
 
     mut total_prompt_tokens = 0
     mut total_pred_tokens = 0
     mut total_cached_tokens = 0
-
-    let cur_session = ($session_id | default "default")
-    let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
-    let is_top_level = ($depth == 0)
-    let metrics_dir = (get_metrics_dir)
-    let metrics_file = if ($env.KEN_METRICS_FILE? | default "" | is-empty) {
-        let now_ts = (date now | format date "%Y%m%d_%H%M%S")
-        let f = ($metrics_dir | path join $"run_($now_ts)_($nu.pid).jsonl")
-        "" | save -f $f
-        $f
-    } else {
-        $env.KEN_METRICS_FILE
-    }
 
     # Export execution context to tools and subagents
     load-env {
@@ -696,6 +895,7 @@ def run_agent [
     }
 
     # Conversation / tool-calling turns (up to 8)
+    mut final_response = ""
     for turn in 0..7 {
         let t_turn_start = (date now)
         mut turn_timings: any = null
@@ -718,13 +918,14 @@ def run_agent [
         # Real-time streaming turn
         mut turn_content = ""
         mut turn_reasoning = ""
+        mut in_reasoning = false
         mut tool_deltas = []
         mut known_call_ids = []
         mut current_line = ""
         mut stream_lines = []
 
         if $is_interactive {
-            print -n "\e7" # Save cursor at start of first line
+            tty_report "\e7" # Save cursor at start of first line
         }
 
         mut curl_args = [-s -N --no-buffer $chat_url -H "Content-Type: application/json"]
@@ -756,12 +957,27 @@ def run_agent [
             # Reasoning tokens
             let r_tok = ($delta.reasoning_content? | default "")
             if not ($r_tok | is-empty) {
+                if not $in_reasoning {
+                    $in_reasoning = true
+                    tty_report $"\n($indent)<\n(ansi d)"
+                }
                 $turn_reasoning = ($turn_reasoning + $r_tok)
-                print -n $"(ansi d)($r_tok)(ansi reset)"
+                tty_report $r_tok
+            }
+
+            let c_tok = ($delta.content? | default "")
+            let tc = ($delta.tool_calls? | default [])
+
+            # Close reasoning tag when transitioning to content or tools
+            if $in_reasoning and ((not ($c_tok | is-empty)) or (not ($tc | is-empty))) {
+                $in_reasoning = false
+                tty_report $"(ansi reset)\n($indent)>\n\n"
+                if $is_interactive {
+                    tty_report "\e7"
+                }
             }
 
             # Content tokens (progressive bat line highlighting with cursor restore)
-            let c_tok = ($delta.content? | default "")
             if not ($c_tok | is-empty) {
                 $turn_content = ($turn_content + $c_tok)
                 if $is_interactive {
@@ -773,49 +989,48 @@ def run_agent [
                             $current_line = ($current_line + $part)
                             if $idx < ($p_count - 1) {
                                 # Newline reached: style line with bat, commit newline, save cursor for next line
-                                let styled = (style_line $current_line)
+                                let styled = (style_line $current_line "markdown" $indent)
                                 let term_cols = (try { term size | get columns } catch { 80 })
-                                let line_len = ($current_line | str length)
+                                let line_len = (($indent + $current_line) | str length)
                                 let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
                                 if $lines_up > 0 {
-                                    print -n $"\e[($lines_up)A\r\e[0J($styled)\n\e7"
+                                    tty_report $"\e[($lines_up)A\r\e[0J($styled)\n\e7"
                                 } else {
-                                    print -n $"\e8\e[0J($styled)\n\e7"
+                                    tty_report $"\e8\e[0J($styled)\n\e7"
                                 }
                                 $current_line = ""
                             } else if not ($current_line | is-empty) {
                                 # Partial line after newline: restore cursor and style
-                                let styled = (style_line $current_line)
+                                let styled = (style_line $current_line "markdown" $indent)
                                 let term_cols = (try { term size | get columns } catch { 80 })
-                                let line_len = ($current_line | str length)
+                                let line_len = (($indent + $current_line) | str length)
                                 let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
                                 if $lines_up > 0 {
-                                    print -n $"\e[($lines_up)A\r\e[0J($styled)"
+                                    tty_report $"\e[($lines_up)A\r\e[0J($styled)"
                                 } else {
-                                    print -n $"\e8\e[0J($styled)"
+                                    tty_report $"\e8\e[0J($styled)"
                                 }
                             }
                         }
                     } else {
                         # Token in current line: restore cursor, clear to end of screen and highlight with bat
                         $current_line = ($current_line + $c_tok)
-                        let styled = (style_line $current_line)
+                        let styled = (style_line $current_line "markdown" $indent)
                         let term_cols = (try { term size | get columns } catch { 80 })
-                        let line_len = ($current_line | str length)
+                        let line_len = (($indent + $current_line) | str length)
                         let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
                         if $lines_up > 0 {
-                            print -n $"\e[($lines_up)A\r\e[0J($styled)"
+                            tty_report $"\e[($lines_up)A\r\e[0J($styled)"
                         } else {
-                            print -n $"\e8\e[0J($styled)"
+                            tty_report $"\e8\e[0J($styled)"
                         }
                     }
                 } else {
-                    print -n $c_tok
+                    tty_report $c_tok
                 }
             }
 
             # Tool call deltas
-            let tc = ($delta.tool_calls? | default [])
             if not ($tc | is-empty) {
                 for it in $tc {
                     mut call_idx = 0
@@ -839,8 +1054,13 @@ def run_agent [
             }
         }
 
+        if $in_reasoning {
+            $in_reasoning = false
+            tty_report $"(ansi reset)\n($indent)>\n\n"
+        }
+
         if $is_interactive and not ($current_line | is-empty) {
-            print ""
+            tty_report "\n"
         }
 
         # Check for API error if nothing was received
@@ -889,7 +1109,7 @@ def run_agent [
         let cum_cost = (get_cumulative_cost)
         let cost_str = (format_cost_label $cost_res $cum_cost)
 
-        if (is-terminal --stdout) and ($turn_timings != null or $turn_usage != null) {
+        if ($turn_timings != null or $turn_usage != null) {
             mut banner_parts = [$"($model_alias):($turn + 1)"]
             let ctx_info = (if $cache_n > 0 {
                 $"($prompt_n)+($pred_n) \(($cache_n)c\)"
@@ -910,8 +1130,7 @@ def run_agent [
             $banner_parts = ($banner_parts | append $cost_str)
 
             let inner = ($banner_parts | str join " | ")
-            let line = $"--- ($inner) ---"
-            tty_report $"\n(ansi d)($line)(ansi reset)\n"
+            tty_report $"\n($indent)] ($agent_name).($model_alias) | (ansi d)($inner)(ansi reset)\n"
         }
 
         # Check for tool calls
@@ -956,15 +1175,24 @@ def run_agent [
         }
 
         # Final assistant text turn
+        let effective_content = if not ($turn_content | is-empty) {
+            $turn_content
+        } else if not ($turn_reasoning | is-empty) {
+            $turn_reasoning
+        } else {
+            ""
+        }
+
         $messages = ($messages | append {
             role: "assistant"
-            content: $turn_content
+            content: $effective_content
         })
 
         # Save snapshot if it was not restored (missing or updated) - local only
         if $model_info.is_local and (not $snapshot_restored) {
+            let slots_url = (get_local_url "slots" $root_conf)
             try {
-                http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=save" ({ model: $model_id, filename: $snap_filename } | to json -r)
+                http post --content-type "application/json" $"($slots_url)/($assigned_slot)?action=save" ({ model: $model_id, filename: $snap_filename } | to json -r)
             }
             $snapshot_restored = true
         }
@@ -982,7 +1210,12 @@ def run_agent [
         }
 
         # Finished turn
+        $final_response = $effective_content
         break
+    }
+
+    if not (is-terminal --stdout) {
+        print -n $final_response
     }
 
     # Final grand-total session banner across all turns, child agents, and ken raw calls
@@ -1030,8 +1263,9 @@ def "main tok" [
 
     if not ($piped_input | is-empty) {
         let content = $piped_input
+        let tok_url = (get_local_url "tokenize" $root_conf)
         let res = (try {
-            http post --content-type "application/json" $TOKENIZE_URL ({ model: $target_model, content: $content } | to json -r)
+            http post --content-type "application/json" $tok_url ({ model: $target_model, content: $content } | to json -r)
         } catch { { tokens: [] } })
         let n_tokens = ($res.tokens | length)
         let n_bytes = ($content | str length)
@@ -1072,11 +1306,12 @@ def "main tok" [
     mut total_tokens = 0
     mut total_bytes = 0
 
+    let tok_url = (get_local_url "tokenize" $root_conf)
     for f in $unique_files {
         let text = (try { open --raw $f } catch { "" })
         let bytes_n = ($text | str length)
         let res = (try {
-            http post --content-type "application/json" $TOKENIZE_URL ({ model: $target_model, content: $text } | to json -r)
+            http post --content-type "application/json" $tok_url ({ model: $target_model, content: $text } | to json -r)
         } catch { { tokens: [] } })
         let tokens_n = ($res.tokens | length)
 
@@ -1116,16 +1351,30 @@ def "main tok" [
 # Subcommand: md (Displays colored markdown)
 def "main md" [
     file?: string
-    --lang: string = "markdown"
+    --lang (-l): string = "markdown"
+    --prefix (-p): string = ""
 ] {
     let has_stdin = (not (is-terminal --stdin))
-    if not ($file | is-empty) and ($file | path exists) {
-        ^bat --plain --paging=never --color=always -l $lang $file
+    let raw_content = if not ($file | is-empty) and ($file | path exists) {
+        open --raw $file
     } else if $has_stdin {
-        ^bat --plain --paging=never --color=always -l $lang
+        try { open --raw /dev/stdin } catch { "" }
     } else {
-        print "Usage: ken md [file.md]"
+        print "Usage: ken md [file.md] [--prefix '  ']"
         print "       cat file.md | ken md"
+        return
+    }
+
+    let rendered = (try {
+        $raw_content | ^bat --plain --paging=never --color=always -l $lang | complete | get stdout
+    } catch {
+        $raw_content
+    })
+
+    if not ($prefix | is-empty) {
+        $rendered | lines | each { |l| $"($prefix)($l)" } | str join "\n" | print
+    } else {
+        print -n $rendered
     }
 }
 
@@ -1162,12 +1411,12 @@ def "main list" [] {
     for a in $agents {
         let a_name = ($a.name | path basename)
         let a_conf = (load_agent_config $a.name $root_conf)
-        let nu_files = (glob ($a.name | path join "*.nu") | each { path parse | get stem } | sort)
+        let agent_tools = (try { get_agent_tools $a.name | get function.name | sort } catch { [] })
         let desc = (if not ($a_conf.description | is-empty) { $" - ($a_conf.description)" } else { "" })
         let def_m = $a_conf.default_model
         print $"  - \e[1;36m($a_name)\e[0m [($def_m)]($desc):"
-        if not ($nu_files | is-empty) {
-            print $"      tools: ($nu_files | str join ', ')"
+        if not ($agent_tools | is-empty) {
+            print $"      tools: ($agent_tools | str join ', ')"
         } else {
             print "      tools: (none)"
         }
@@ -1225,8 +1474,11 @@ def "main prefill" [
             $payload = ($payload | insert tools $tools)
         }
 
+        let chat_url = (get_local_url "chat" $root_conf)
+        let slots_url = (get_local_url "slots" $root_conf)
+
         let run_res = (try {
-            http post --content-type "application/json" --max-time 60sec $LLAMA_URL ($payload | to json -r)
+            http post --content-type "application/json" --max-time 60sec $chat_url ($payload | to json -r)
         } catch { |e| null })
 
         if $run_res == null {
@@ -1235,7 +1487,7 @@ def "main prefill" [
         }
 
         let save_res = (try {
-            http post --content-type "application/json" $"($SLOTS_URL)/0?action=save" ({ model: $target_model, filename: $snap_filename } | to json -r)
+            http post --content-type "application/json" $"($slots_url)/0?action=save" ({ model: $target_model, filename: $snap_filename } | to json -r)
         } catch { |e| null })
 
         if $save_res != null and ($save_res.timings?.save_ms? != null) {
@@ -1251,7 +1503,7 @@ def "main prefill" [
 # Subcommand: raw (Direct completion against any configured model without tools or session overhead)
 def "main raw" [
     prompt?: string              # Prompt text (or pipe via stdin)
-    --model (-m): string = "l"   # Model alias (defaults to 'l' for fast local extraction)
+    --model (-m): string = ""    # Model alias (defaults to default_model in config)
     --system (-s): string = ""   # Optional system instructions
     --max-tokens: int = 1024     # Max output tokens
     --temp: float = 0.1          # Sampling temperature
@@ -1273,7 +1525,8 @@ def "main raw" [
 
     load_ken_env
     let root_conf = (load_root_config)
-    let model_info = (resolve_model_info $model $root_conf)
+    let target_m = if not ($model | is-empty) { $model } else { $root_conf.default_model }
+    let model_info = (resolve_model_info $target_m $root_conf)
     let chat_url = $"($model_info.base_url)/chat/completions"
 
     # Setup metrics tracking if not inherited
@@ -1306,7 +1559,13 @@ def "main raw" [
         $payload = ($payload | insert timings_per_token true | insert cache_prompt true)
     }
 
+    let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
+    let indent = ("" | fill -c " " -w ($depth * 2))
     let t_start = (date now)
+    let time_start_str = ($t_start | format date "%H:%M:%S")
+
+    tty_report $"\n($indent)[ raw.($model) @ ($time_start_str)\n"
+
     mut curl_args = [-s -N --no-buffer $chat_url -H "Content-Type: application/json"]
     if ($model_info.auth_header? | default "" | is-not-empty) {
         $curl_args = ($curl_args | append [-H $"Authorization: ($model_info.auth_header)"])
@@ -1339,8 +1598,12 @@ def "main raw" [
         let c_tok = ($chunk.choices?.0?.delta?.content? | default "")
         if not ($c_tok | is-empty) {
             $full_content = ($full_content + $c_tok)
-            print -n $c_tok
+            tty_report $c_tok
         }
+    }
+
+    if not ($full_content | str ends-with "\n") {
+        tty_report "\n"
     }
 
     let t_dur = ((date now) - $t_start)
@@ -1351,10 +1614,6 @@ def "main raw" [
         let err_raw = ($stream_lines | str join "\n")
         print -e $"\n(ansi red_bold)[Ken Raw Error](ansi reset) Request to ($chat_url) failed:\n($err_raw)"
         return
-    }
-
-    if (is-terminal --stdout) and (not ($full_content | str ends-with "\n")) {
-        print ""
     }
 
     let prompt_n = ($raw_timings.prompt_n? | default ($raw_usage.prompt_tokens? | default 0))
@@ -1386,7 +1645,7 @@ def "main raw" [
     } else {
         $"($prompt_n)+($pred_n)"
     }
-    mut raw_parts = [$"[raw/($model)] ($ctx_str)"]
+    mut raw_parts = [$ctx_str]
     if $ttft_ms > 0 {
         $raw_parts = ($raw_parts | append (format_ms $ttft_ms))
     }
@@ -1399,14 +1658,37 @@ def "main raw" [
     $raw_parts = ($raw_parts | append $cost_str)
 
     let raw_line = ($raw_parts | str join " | ")
-    tty_report $"\n(ansi d)($raw_line)(ansi reset)\n"
+    tty_report $"\n($indent)] raw.($model) | (ansi d)($raw_line)(ansi reset)\n"
+
+    if not (is-terminal --stdout) {
+        print -n $full_content
+    }
 }
 
 # Subcommand: schema (Dump OpenAI tool schema for an agent)
-def "main schema" [agent: string = "orchestrator"] {
-    let agent_dir = (resolve_agent_dir $agent)
+def "main schema" [agent?: string] {
+    let root_conf = (load_root_config)
+    let target = if ($agent | default "" | is-not-empty) { $agent } else { $root_conf.default_agent }
+    let agent_dir = (resolve_agent_dir $target)
     let tools = (get_agent_tools $agent_dir)
     $tools | to json
+}
+
+# Subcommand: call_agent (Delegate task to a specialized domain agent)
+def "main call_agent" [
+    --agent (-a): string          # Target agent (e.g. coder, task, plan, fs, sys, mail)
+    --task (-t): string           # The specific prompt or task for the agent
+    --model (-m): string = ""     # Optional model override
+] {
+    do_call_agent $agent $task $model
+}
+
+def "main call-agent" [
+    --agent (-a): string
+    --task (-t): string
+    --model (-m): string = ""
+] {
+    do_call_agent $agent $task $model
 }
 
 # Subcommand: session (Manage persistent chat sessions)
