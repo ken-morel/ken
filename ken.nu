@@ -180,6 +180,12 @@ def get_session_dir [] {
     $d
 }
 
+def get_metrics_dir [] {
+    let d = ($env.HOME | path join ".cache" "ken" "metrics")
+    mkdir $d
+    $d
+}
+
 def get_slots_dir [model: string = $DEFAULT_MODEL] {
     let d = ($env.HOME | path join ".cache" $"($model)-server" "slots")
     mkdir $d
@@ -408,10 +414,68 @@ def get_agent_tools [agent_dir: string] {
 
 def record_metric [item: record] {
     let f = ($env.KEN_METRICS_FILE? | default "")
-    if ($f | is-not-empty) and ($f | path exists) {
+    if ($f | is-not-empty) {
         try {
             $"($item | to json -r)\n" | save --append $f
         }
+    }
+}
+
+def get_cumulative_cost [] {
+    let f = ($env.KEN_METRICS_FILE? | default "")
+    if ($f | is-not-empty) and ($f | path exists) {
+        let rows = (try { open --raw $f | lines | where ($it | is-not-empty) | each { from json } } catch { [] })
+        if not ($rows | is-empty) {
+            let sum_usd = ($rows | get cost_usd | math sum)
+            let sum_cfa = ($rows | get cost_cfa | math sum)
+            return { usd: $sum_usd, cfa: $sum_cfa }
+        }
+    }
+    { usd: 0.0, cfa: 0.0 }
+}
+
+def format_cost_label [cost_res: record, cum_cost: record] {
+    if ($cost_res.usd == 0.0 or $cost_res.is_free) and ($cum_cost.usd == 0.0) {
+        return "$0"
+    }
+    let u_turn = if ($cost_res.usd == 0.0 or $cost_res.is_free) {
+        "$0"
+    } else if $cost_res.usd < 0.0001 {
+        $"$($cost_res.usd | math round -p 6)"
+    } else {
+        $"$($cost_res.usd | math round -p 4)"
+    }
+
+    let u_tot = if $cum_cost.usd == 0.0 {
+        "$0"
+    } else if $cum_cost.usd < 0.0001 {
+        $"$($cum_cost.usd | math round -p 6)"
+    } else {
+        $"$($cum_cost.usd | math round -p 4)"
+    }
+    let cfa_tot = $"($cum_cost.cfa | math round -p 1) CFA"
+    $"($u_turn) \(tot: ($u_tot) / ($cfa_tot)\)"
+}
+
+def format_ms [ms: int] {
+    if $ms < 1000 {
+        $"($ms)ms ttft"
+    } else {
+        $"($ms / 1000.0 | math round -p 1)s ttft"
+    }
+}
+
+def format_duration [dur: duration] {
+    let sec = (($dur | into int) / 1_000_000_000.0)
+    if $sec < 1.0 {
+        let ms = ($sec * 1000.0 | math round)
+        $"($ms)ms"
+    } else if $sec < 60.0 {
+        $"($sec | math round -p 1)s"
+    } else {
+        let m = ($sec // 60 | into int)
+        let s = ($sec mod 60 | math round -p 1)
+        $"($m)m ($s)s"
     }
 }
 
@@ -467,7 +531,7 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
 
     let t_start = (date now)
     let time_start_str = ($t_start | format date "%H:%M:%S")
-    tty_report $"\n(ansi cyan)[call](ansi reset) ($agent_name)/($fn_name) ($formatted_args) \(at ($time_start_str)\)\n"
+    tty_report $"\n(ansi cyan)[call](ansi reset) ($agent_name)/($fn_name) ($formatted_args) @ ($time_start_str)\n"
     let res = (^nu $tool_path ...$pos_args ...$named_args | complete)
     let t_end = (date now)
     let t_dur = ($t_end - $t_start)
@@ -479,10 +543,10 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
         let n_tokens = (count_text_tokens $output)
         # Print the entire tool output so the user can inspect intermediate results and context
         tty_report $"($output)\n"
-        tty_report $"(ansi green)[done](ansi reset) ($agent_name)/($fn_name) -> ($n_lines) lines, ($n_tokens) tok \(took ($t_dur) @ ($time_end_str)\)\n\n"
+        tty_report $"(ansi green)[done](ansi reset) ($agent_name)/($fn_name) -> ($n_lines)L ($n_tokens)t \((format_duration $t_dur) @ ($time_end_str)\)\n\n"
         $output
     } else {
-        tty_report $"(ansi red)[error](ansi reset) ($agent_name)/($fn_name) -> exit ($res.exit_code) \(took ($t_dur) @ ($time_end_str)\)\n"
+        tty_report $"(ansi red)[error](ansi reset) ($agent_name)/($fn_name) -> exit ($res.exit_code) \((format_duration $t_dur) @ ($time_end_str)\)\n"
         if not ($res.stderr | is-empty) { tty_report $"($res.stderr)\n" }
         if not ($res.stdout | is-empty) { tty_report $"($res.stdout)\n" }
         tty_report "\n"
@@ -611,12 +675,14 @@ def run_agent [
     let cur_session = ($session_id | default "default")
     let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
     let is_top_level = ($depth == 0)
-    let metrics_file = if $is_top_level {
-        let f = $"/tmp/ken_metrics_($nu.pid).jsonl"
+    let metrics_dir = (get_metrics_dir)
+    let metrics_file = if ($env.KEN_METRICS_FILE? | default "" | is-empty) {
+        let now_ts = (date now | format date "%Y%m%d_%H%M%S")
+        let f = ($metrics_dir | path join $"run_($now_ts)_($nu.pid).jsonl")
         "" | save -f $f
         $f
     } else {
-        ($env.KEN_METRICS_FILE? | default "")
+        $env.KEN_METRICS_FILE
     }
 
     # Export execution context to tools and subagents
@@ -795,43 +861,44 @@ def run_agent [
         $total_pred_tokens = ($total_pred_tokens + $pred_n)
         $total_cached_tokens = ($total_cached_tokens + $cache_n)
 
+        # Cost calculation & metrics recording
+        let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
+        let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
+        record_metric {
+            source: $"($agent_name)"
+            model: $model_alias
+            turn: ($turn + 1)
+            prompt_tokens: $prompt_n
+            completion_tokens: $pred_n
+            cached_tokens: $cache_n
+            cost_usd: $cost_res.usd
+            cost_cfa: $cost_res.cfa
+        }
+        let cum_cost = (get_cumulative_cost)
+        let cost_str = (format_cost_label $cost_res $cum_cost)
+
         if (is-terminal --stdout) and ($turn_timings != null or $turn_usage != null) {
-            mut banner_parts = [$"--- ($model_alias)"]
+            mut banner_parts = [$"($model_alias):($turn + 1)"]
             let ctx_info = (if $cache_n > 0 {
-                $"ctx: ($prompt_n) in + ($pred_n) out \(($cache_n) cached\)"
+                $"($prompt_n)+($pred_n) \(($cache_n)c\)"
             } else {
-                $"ctx: ($prompt_n) in + ($pred_n) out"
+                $"($prompt_n)+($pred_n)"
             })
             $banner_parts = ($banner_parts | append $ctx_info)
             if $ttft_ms > 0 {
-                $banner_parts = ($banner_parts | append $"ttft: ($ttft_ms)ms")
+                $banner_parts = ($banner_parts | append (format_ms $ttft_ms))
             }
             if $gen_tps > 0 {
-                $banner_parts = ($banner_parts | append $"gen: ($gen_tps) t/s")
+                $banner_parts = ($banner_parts | append $"($gen_tps) t/s")
             }
-            $banner_parts = ($banner_parts | append $"took: ($turn_dur) @ ($time_now_str)")
+            $banner_parts = ($banner_parts | append $"((format_duration $turn_dur)) @ ($time_now_str)")
 
             let cum_tokens = ($total_prompt_tokens + $total_pred_tokens)
-            $banner_parts = ($banner_parts | append $"total: ($cum_tokens) tok, ($total_elapsed)")
+            $banner_parts = ($banner_parts | append $"tot: ($cum_tokens)t, ((format_duration $total_elapsed))")
+            $banner_parts = ($banner_parts | append $cost_str)
 
-            # Cost calculation
-            let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
-            let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
-            record_metric {
-                source: $"($agent_name)"
-                model: $model_alias
-                turn: ($turn + 1)
-                prompt_tokens: $prompt_n
-                completion_tokens: $pred_n
-                cached_tokens: $cache_n
-                cost_usd: $cost_res.usd
-                cost_cfa: $cost_res.cfa
-            }
-            let cost_label = (if $cost_res.is_free { "free" } else { $cost_res.label })
-            $banner_parts = ($banner_parts | append $"cost: ($cost_label)")
-
-            $banner_parts = ($banner_parts | append "---")
-            let line = ($banner_parts | str join " | ")
+            let inner = ($banner_parts | str join " | ")
+            let line = $"--- ($inner) ---"
             tty_report $"\n(ansi d)($line)(ansi reset)\n"
         }
 
@@ -917,24 +984,23 @@ def run_agent [
             let total_dur = ((date now) - $t_run_start)
             let time_str = (date now | format date "%H:%M:%S")
 
-            mut summary_parts = [$"=== ($agent_name).($model_alias) total ==="]
-            $summary_parts = ($summary_parts | append $"all: ($total_p + $total_c) tok \(($total_p) in, ($total_c) out\)")
-            $summary_parts = ($summary_parts | append $"time: ($total_dur) @ ($time_str)")
+            mut summary_parts = [$"($agent_name).($model_alias)"]
+            $summary_parts = ($summary_parts | append $"($total_p + $total_c)t \(($total_p)in, ($total_c)out\)")
+            $summary_parts = ($summary_parts | append $"((format_duration $total_dur)) @ ($time_str)")
             if $total_usd > 0.0 {
                 let u_str = (if $total_usd < 0.0001 { $"$($total_usd | math round -p 6)" } else { $"$($total_usd | math round -p 4)" })
-                let c_str = $"($total_cfa | math round -p 2) CFA"
-                $summary_parts = ($summary_parts | append $"total cost: ($u_str) \(($c_str)\)")
+                let c_str = $"($total_cfa | math round -p 1) CFA"
+                $summary_parts = ($summary_parts | append $"tot: ($u_str) \(($c_str)\)")
             } else {
-                $summary_parts = ($summary_parts | append "total cost: $0.0000 (free)")
+                $summary_parts = ($summary_parts | append "tot: $0")
             }
-            $summary_parts = ($summary_parts | append "===")
 
-            let summary_line = ($summary_parts | str join " | ")
+            let inner = ($summary_parts | str join " | ")
+            let summary_line = $"=== ($inner) ==="
             if (is-terminal --stdout) and (not $no_md) {
                 tty_report $"\n(ansi green_bold)($summary_line)(ansi reset)\n"
             }
         }
-        try { rm -f $metrics_file }
     }
 }
 
@@ -1198,79 +1264,130 @@ def "main raw" [
     let model_info = (resolve_model_info $model $root_conf)
     let chat_url = $"($model_info.base_url)/chat/completions"
 
+    # Setup metrics tracking if not inherited
+    let metrics_dir = (get_metrics_dir)
+    let metrics_file = if ($env.KEN_METRICS_FILE? | default "" | is-empty) {
+        let now_ts = (date now | format date "%Y%m%d_%H%M%S")
+        let f = ($metrics_dir | path join $"run_($now_ts)_($nu.pid).jsonl")
+        "" | save -f $f
+        $f
+    } else {
+        $env.KEN_METRICS_FILE
+    }
+    load-env { KEN_METRICS_FILE: $metrics_file }
+
     mut messages = []
     if not ($system | is-empty) {
         $messages = ($messages | append { role: "system", content: $system })
     }
     $messages = ($messages | append { role: "user", content: $full_prompt })
 
-    let payload = {
+    mut payload = {
         model: $model_info.model_name
         messages: $messages
         temperature: $temp
         max_tokens: $max_tokens
-        stream: false
+        stream: true
+        stream_options: { include_usage: true }
+    }
+    if $model_info.is_local {
+        $payload = ($payload | insert timings_per_token true | insert cache_prompt true)
     }
 
     let t_start = (date now)
-    let res = (try {
-        mut headers = ["Content-Type" "application/json"]
-        if ($model_info.auth_header? | default "" | is-not-empty) {
-            $headers = ($headers | append ["Authorization" $model_info.auth_header])
+    mut curl_args = [-s -N --no-buffer $chat_url -H "Content-Type: application/json"]
+    if ($model_info.auth_header? | default "" | is-not-empty) {
+        $curl_args = ($curl_args | append [-H $"Authorization: ($model_info.auth_header)"])
+    }
+    $curl_args = ($curl_args | append [-d ($payload | to json -r)])
+
+    mut full_content = ""
+    mut raw_timings: any = null
+    mut raw_usage: any = null
+    mut stream_lines = []
+
+    for line in (^curl ...$curl_args | lines) {
+        let tr = ($line | str trim)
+        if ($tr | is-empty) { continue }
+        $stream_lines = ($stream_lines | append $tr)
+
+        if not ($line | str starts-with "data: {") {
+            continue
         }
-        http post --headers $headers --content-type "application/json" $chat_url ($payload | to json -r)
-    } catch { |e|
-        return $"Error calling model '($model)': ($e.msg)"
-    })
+        let chunk = (try { $line | str substring 6.. | from json } catch { null })
+        if $chunk == null { continue }
+
+        if ($chunk.timings? | default null) != null {
+            $raw_timings = $chunk.timings
+        }
+        if ($chunk.usage? | default null) != null {
+            $raw_usage = $chunk.usage
+        }
+
+        let c_tok = ($chunk.choices?.0?.delta?.content? | default "")
+        if not ($c_tok | is-empty) {
+            $full_content = ($full_content + $c_tok)
+            print -n $c_tok
+        }
+    }
 
     let t_dur = ((date now) - $t_start)
     let time_now = (date now | format date "%H:%M:%S")
 
-    let content = ($res.choices?.0?.message?.content? | default "")
-    if ("/dev/tty" | path exists) {
-        let prompt_n = ($res.timings?.prompt_n? | default ($res.usage?.prompt_tokens? | default 0))
-        let pred_n = ($res.timings?.predicted_n? | default ($res.usage?.completion_tokens? | default (count_text_tokens $content)))
-        let cache_n = ($res.timings?.cache_n? | default ($res.usage?.prompt_tokens_details?.cached_tokens? | default 0))
-        let ttft_ms = ($res.timings?.prompt_ms? | default 0 | math round)
-        let gen_tps = ($res.timings?.predicted_per_second? | default 0 | into float | math round -p 1)
-        let n_lines = ($content | lines | length)
-
-        mut raw_parts = [$"[raw/($model)]"]
-        let ctx_str = if $cache_n > 0 {
-            $"ctx: ($prompt_n) in + ($pred_n) out \(($cache_n) cached\)"
-        } else {
-            $"ctx: ($prompt_n) in + ($pred_n) out"
-        }
-        $raw_parts = ($raw_parts | append $ctx_str)
-        if $ttft_ms > 0 {
-            $raw_parts = ($raw_parts | append $"ttft: ($ttft_ms)ms")
-        }
-        if $gen_tps > 0 {
-            $raw_parts = ($raw_parts | append $"gen: ($gen_tps) t/s")
-        }
-        $raw_parts = ($raw_parts | append $"-> ($n_lines) lines, ($pred_n) tok \(took ($t_dur) @ ($time_now)\)")
-
-        let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
-        let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
-        let cost_label = (if $cost_res.is_free { "free" } else { $cost_res.label })
-        $raw_parts = ($raw_parts | append $"cost: ($cost_label)")
-
-        record_metric {
-            source: "raw"
-            model: $model
-            turn: 1
-            prompt_tokens: $prompt_n
-            completion_tokens: $pred_n
-            cached_tokens: $cache_n
-            cost_usd: $cost_res.usd
-            cost_cfa: $cost_res.cfa
-        }
-
-        let raw_line = ($raw_parts | str join " | ")
-        $"\e[2m($raw_line)\e[0m\n" | save --append "/dev/tty"
+    # If stream failed, print error to stderr
+    if ($full_content | is-empty) and (not ($stream_lines | is-empty)) {
+        let err_raw = ($stream_lines | str join "\n")
+        print -e $"\n(ansi red_bold)[Ken Raw Error](ansi reset) Request to ($chat_url) failed:\n($err_raw)"
+        return
     }
 
-    $content
+    if (is-terminal --stdout) and (not ($full_content | str ends-with "\n")) {
+        print ""
+    }
+
+    let prompt_n = ($raw_timings.prompt_n? | default ($raw_usage.prompt_tokens? | default 0))
+    let pred_n = ($raw_timings.predicted_n? | default ($raw_usage.completion_tokens? | default (count_text_tokens $full_content)))
+    let cache_n = ($raw_timings.cache_n? | default ($raw_usage.prompt_tokens_details?.cached_tokens? | default 0))
+    let ttft_ms = ($raw_timings.prompt_ms? | default 0 | math round)
+    let gen_tps = ($raw_timings.predicted_per_second? | default 0 | into float | math round -p 1)
+    let n_lines = ($full_content | lines | length)
+
+    let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
+    let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
+
+    record_metric {
+        source: "raw"
+        model: $model
+        turn: 1
+        prompt_tokens: $prompt_n
+        completion_tokens: $pred_n
+        cached_tokens: $cache_n
+        cost_usd: $cost_res.usd
+        cost_cfa: $cost_res.cfa
+    }
+
+    let cum_cost = (get_cumulative_cost)
+    let cost_str = (format_cost_label $cost_res $cum_cost)
+
+    let ctx_str = if $cache_n > 0 {
+        $"($prompt_n)+($pred_n) \(($cache_n)c\)"
+    } else {
+        $"($prompt_n)+($pred_n)"
+    }
+    mut raw_parts = [$"[raw/($model)] ($ctx_str)"]
+    if $ttft_ms > 0 {
+        $raw_parts = ($raw_parts | append (format_ms $ttft_ms))
+    }
+    let speed_and_out = if $gen_tps > 0 {
+        $"($gen_tps) t/s -> ($n_lines)L ($pred_n)t \(((format_duration $t_dur)) @ ($time_now)\)"
+    } else {
+        $"-> ($n_lines)L ($pred_n)t \(((format_duration $t_dur)) @ ($time_now)\)"
+    }
+    $raw_parts = ($raw_parts | append $speed_and_out)
+    $raw_parts = ($raw_parts | append $cost_str)
+
+    let raw_line = ($raw_parts | str join " | ")
+    tty_report $"\n(ansi d)($raw_line)(ansi reset)\n"
 }
 
 # Subcommand: schema (Dump OpenAI tool schema for an agent)
