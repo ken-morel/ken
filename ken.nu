@@ -589,8 +589,15 @@ def run_agent [
 
     let is_interactive = (is-terminal --stdout) and ($env.TERM? != "dumb") and (not $no_md)
     let t_run_start = (date now)
-    mut final_timings: any = null
-    mut final_usage: any = null
+    let time_start_str = ($t_run_start | format date "%H:%M:%S")
+
+    if (is-terminal --stdout) and (not $no_md) {
+        tty_report $"(ansi d)[start] ($agent_name).($model_alias) @ ($time_start_str)(ansi reset)\n"
+    }
+
+    mut total_prompt_tokens = 0
+    mut total_pred_tokens = 0
+    mut total_cached_tokens = 0
 
     let cur_session = ($session_id | default "default")
 
@@ -605,6 +612,10 @@ def run_agent [
 
     # Conversation / tool-calling turns (up to 8)
     for turn in 0..7 {
+        let t_turn_start = (date now)
+        mut turn_timings: any = null
+        mut turn_usage: any = null
+
         mut payload = {
             model: $model_id
             messages: $messages
@@ -648,10 +659,10 @@ def run_agent [
             if $chunk == null { continue }
 
             if ($chunk.timings? | default null) != null {
-                $final_timings = $chunk.timings
+                $turn_timings = $chunk.timings
             }
             if ($chunk.usage? | default null) != null {
-                $final_usage = $chunk.usage
+                $turn_usage = $chunk.usage
             }
 
             let delta = ($chunk.choices?.0?.delta? | default {})
@@ -742,6 +753,60 @@ def run_agent [
             return
         }
 
+        # Turn metrics and telemetry
+        let turn_dur = ((date now) - $t_turn_start)
+        let total_elapsed = ((date now) - $t_run_start)
+        let time_now_str = (date now | format date "%H:%M:%S")
+
+        let cache_n = (if ($turn_timings.cache_n? | default null) != null {
+            $turn_timings.cache_n
+        } else if ($turn_usage.prompt_tokens_details?.cached_tokens? | default null) != null {
+            $turn_usage.prompt_tokens_details.cached_tokens
+        } else if ($turn_usage.prompt_cache_hit_tokens? | default null) != null {
+            $turn_usage.prompt_cache_hit_tokens
+        } else {
+            0
+        })
+        let prompt_n = ($turn_timings.prompt_n? | default ($turn_usage.prompt_tokens? | default 0))
+        let pred_n = ($turn_timings.predicted_n? | default ($turn_usage.completion_tokens? | default 0))
+        let ttft_ms = ($turn_timings.prompt_ms? | default 0 | math round)
+        let gen_tps = ($turn_timings.predicted_per_second? | default 0 | into float | math round -p 1)
+
+        $total_prompt_tokens = ($total_prompt_tokens + $prompt_n)
+        $total_pred_tokens = ($total_pred_tokens + $pred_n)
+        $total_cached_tokens = ($total_cached_tokens + $cache_n)
+
+        if (is-terminal --stdout) and ($turn_timings != null or $turn_usage != null) {
+            mut banner_parts = [$"--- ($model_alias)"]
+            let ctx_info = (if $cache_n > 0 {
+                $"ctx: ($prompt_n)+($pred_n) \(($cache_n) cached\)"
+            } else {
+                $"ctx: ($prompt_n)+($pred_n)"
+            })
+            $banner_parts = ($banner_parts | append $ctx_info)
+            if $ttft_ms > 0 {
+                $banner_parts = ($banner_parts | append $"ttft: ($ttft_ms)ms")
+            }
+            if $gen_tps > 0 {
+                $banner_parts = ($banner_parts | append $"gen: ($gen_tps) t/s")
+            }
+            $banner_parts = ($banner_parts | append $"took: ($turn_dur) @ ($time_now_str)")
+
+            let cum_tokens = ($total_prompt_tokens + $total_pred_tokens)
+            $banner_parts = ($banner_parts | append $"total: ($cum_tokens) tok, ($total_elapsed)")
+
+            # Cost calculation
+            let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
+            let cost_res = (calculate_cost $model_info.pricing $total_prompt_tokens $total_pred_tokens $total_cached_tokens $rate_cfa)
+            if not $cost_res.is_free {
+                $banner_parts = ($banner_parts | append $"cost: ($cost_res.label)")
+            }
+
+            $banner_parts = ($banner_parts | append "---")
+            let line = ($banner_parts | str join " | ")
+            tty_report $"\n(ansi d)($line)(ansi reset)\n"
+        }
+
         # Check for tool calls
         if not ($tool_deltas | is-empty) {
             # Reconstruct tool calls
@@ -795,53 +860,6 @@ def run_agent [
                 http post --content-type "application/json" $"($SLOTS_URL)/($assigned_slot)?action=save" ({ model: $model_id, filename: $snap_filename } | to json -r)
             }
             $snapshot_restored = true
-        }
-
-        # Footer stats banner
-        if (is-terminal --stdout) and ($final_timings != null or $final_usage != null) {
-            let cache_n = (if ($final_timings.cache_n? | default null) != null {
-                $final_timings.cache_n
-            } else if ($final_usage.prompt_tokens_details?.cached_tokens? | default null) != null {
-                $final_usage.prompt_tokens_details.cached_tokens
-            } else if ($final_usage.prompt_cache_hit_tokens? | default null) != null {
-                $final_usage.prompt_cache_hit_tokens
-            } else {
-                0
-            })
-            let prompt_n = ($final_timings.prompt_n? | default ($final_usage.prompt_tokens? | default 0))
-            let pred_n = ($final_timings.predicted_n? | default ($final_usage.completion_tokens? | default 0))
-            let ttft_ms = ($final_timings.prompt_ms? | default 0 | math round)
-            let gen_tps = ($final_timings.predicted_per_second? | default 0 | into float | math round -p 1)
-
-            mut banner_parts = [("--- " + $model_alias)]
-            let ctx_info = (if $cache_n > 0 {
-                $"ctx: ($prompt_n)+($pred_n) \(($cache_n) cached\)"
-            } else {
-                $"ctx: ($prompt_n)+($pred_n)"
-            })
-            $banner_parts = ($banner_parts | append $ctx_info)
-            if $ttft_ms > 0 {
-                $banner_parts = ($banner_parts | append $"ttft: ($ttft_ms)ms")
-            }
-            if $gen_tps > 0 {
-                $banner_parts = ($banner_parts | append $"gen: ($gen_tps) t/s")
-            }
-
-            let total_dur = ((date now) - $t_run_start)
-            let time_str = (date now | format date "%H:%M:%S")
-            $banner_parts = ($banner_parts | append $"time: ($total_dur) @ ($time_str)")
-
-            # Cost calculation
-            let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
-            let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
-            if not $cost_res.is_free {
-                $banner_parts = ($banner_parts | append $"cost: ($cost_res.label)")
-            }
-
-            $banner_parts = ($banner_parts | append "---")
-
-            let line = ($banner_parts | str join " | ")
-            print $"\n(ansi d)($line)(ansi reset)"
         }
 
         # Save session history
