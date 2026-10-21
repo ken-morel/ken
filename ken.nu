@@ -893,7 +893,7 @@ def "main list" [] {
             let pricing_str = (if $p_in == 0.0 and $p_out == 0.0 {
                 "free"
             } else {
-                $"in: \$$($p_in)/1M, out: \$$($p_out)/1M"
+                $"in: \$($p_in)/1M, out: \$($p_out)/1M"
             })
             print $"    - \e[1;32m($m_alias)\e[0m -> ($m_name) [($m_ctx) ctx] \(($pricing_str)\) - ($m_desc)"
         }
