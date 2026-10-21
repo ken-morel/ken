@@ -38,7 +38,8 @@ def main [
     let supported_models = ($target_conf.supported_models? | default [])
     let target_default = ($target_conf.default_model? | default "")
     let caller_model = ($env.KEN_MODEL? | default "")
-    let is_cloud_caller = ($caller_model in ["adc" "adr" "agf" "agl" "agp" "dskc" "dskr" "gf" "gp"])
+    # Standard: any multi-letter model alias starting with 'a' is remote/cloud (ad* for DeepSeek, ag* for Gemini)
+    let is_cloud_caller = ($caller_model | str starts-with "a")
 
     let chosen_model = if not ($model | is-empty) {
         $model
