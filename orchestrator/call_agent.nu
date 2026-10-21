@@ -16,7 +16,7 @@ def main [
 
     # Print ASCII progress report to /dev/tty
     if ("/dev/tty" | path exists) {
-        $"\n[call] agent: ($agent) | model: ($model) | task: ($task | str substring 0..60)...\n" | save --append "/dev/tty"
+        $"\n[call] agent: ($agent) | model: ($model) | task: ($task)\n" | save --append "/dev/tty"
     }
 
     let ken_nu = ($env.KEN_ROOT? | default ($env.HOME | path join "ken") | path join "ken.nu")

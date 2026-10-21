@@ -34,7 +34,7 @@ def main [
     }
 
     if ("/dev/tty" | path exists) {
-        $"[gen_image] rendering: ($final_prompt | str substring 0..50)...\n" | save --append "/dev/tty"
+        $"[gen_image] rendering: ($final_prompt)\n" | save --append "/dev/tty"
     }
 
     let backend = (which gen-img | get path.0? | default ($env.HOME | path join ".config" "bin" "gen-img"))

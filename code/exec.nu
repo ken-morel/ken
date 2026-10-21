@@ -12,7 +12,7 @@ def main [
     let res = (^timeout --kill-after=2 ($timeout | into string) bash -c $command | complete)
     mut out = if ($res.stdout | is-empty) { $res.stderr } else { $res.stdout }
     if ($out | str length) > 4000 {
-        $out = ($out | str substring 0..4000) + "\n...[truncated]"
+        $out = ($out) + "\n[truncated]"
     }
     $out
 }

@@ -6,7 +6,7 @@ def main [
     --speed (-s): string = "1.0" # Speech speed multiplier (e.g. 1.0, 1.2)
 ] {
     if ("/dev/tty" | path exists) {
-        $"\n[voice/speak] speaking: ($text | str substring 0..40)...\n" | save --append "/dev/tty"
+        $"\n[voice/speak] speaking: ($text)\n" | save --append "/dev/tty"
     }
 
     let script_dir = ($env.FILE_PWD? | default ($env.PWD | path join "voice"))
