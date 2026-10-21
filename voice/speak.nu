@@ -10,7 +10,7 @@ def main [
     }
 
     let script_dir = ($env.FILE_PWD? | default ($env.PWD | path join "voice"))
-    let runner = ($script_dir | path join "readaloud.k")
+    let runner = ($script_dir | path join "readaloud.sh")
     
     let res = (^$runner -s $speed $text | complete)
     if ($res.exit_code == 0) {

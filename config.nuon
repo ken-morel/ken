@@ -68,19 +68,19 @@
             api_key_env: "GEMINI_API_KEY"
             models: {
                 agl: {
-                    name: "gemini-3-flash-lite-latest"
+                    name: "gemini-flash-lite-latest"
                     description: "Gemini 3 Flash (Cloud) - 1M token context window, fast cloud fallback"
                     ctx: 1048576
                     pricing: { input: 0.15, output: 0.60, cache_hit: 0.0375 }
                 }
                 agf: {
-                    name: "gemini-3-flash-latest"
+                    name: "gemini-flash-latest"
                     description: "Gemini 3 Flash (Cloud) - 1M token context window, fast cloud fallback"
                     ctx: 1048576
                     pricing: { input: 0.15, output: 0.60, cache_hit: 0.0375 }
                 }
                 agp: {
-                    name: "gemini-3.1-pro-preview"
+                    name: "gemini-pro-latest"
                     description: "Gemini 3.1 Pro (Cloud) - large context, heavy reasoning cloud fallback"
                     ctx: 1048576
                     pricing: { input: 1.25, output: 5.0, cache_hit: 0.31 }

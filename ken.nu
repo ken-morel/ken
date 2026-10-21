@@ -719,6 +719,7 @@ def run_agent [
         mut turn_content = ""
         mut turn_reasoning = ""
         mut tool_deltas = []
+        mut known_call_ids = []
         mut current_line = ""
         mut stream_lines = []
 
@@ -816,14 +817,25 @@ def run_agent [
             # Tool call deltas
             let tc = ($delta.tool_calls? | default [])
             if not ($tc | is-empty) {
-                let normalized = ($tc | each { |it|
-                    if ($it.index? | default null) == null {
-                        $it | insert index 0
-                    } else {
-                        $it
+                for it in $tc {
+                    mut call_idx = 0
+                    if ($it.index? | default null) != null {
+                        $call_idx = ($it.index | into int)
+                    } else if ($it.id? | default null) != null and ($it.id | is-not-empty) {
+                        let cur_id = $it.id
+                        let existing_idx = ($known_call_ids | enumerate | where { |r| $r.item == $cur_id } | get -o index | first)
+                        if $existing_idx != null {
+                            $call_idx = $existing_idx
+                        } else {
+                            $call_idx = ($known_call_ids | length)
+                            $known_call_ids = ($known_call_ids | append $it.id)
+                        }
+                    } else if not ($known_call_ids | is-empty) {
+                        $call_idx = (($known_call_ids | length) - 1)
                     }
-                })
-                $tool_deltas = ($tool_deltas | append $normalized)
+
+                    $tool_deltas = ($tool_deltas | append ($it | upsert index $call_idx))
+                }
             }
         }
 
