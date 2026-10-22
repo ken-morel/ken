@@ -99,6 +99,8 @@ def resolve_model_info [model_alias: string, root_conf: record] {
                 auth_header: $auth_hdr
                 pricing: ($m_info.pricing? | default { input: 0.0, output: 0.0, cache_hit: 0.0 })
                 is_local: ($p_name == "local")
+                thinking: ($m_info.thinking? | default ($m_info.options?.thinking? | default null))
+                reasoning_effort: ($m_info.reasoning_effort? | default ($m_info.options?.reasoning_effort? | default null))
             }
         }
 
@@ -123,6 +125,8 @@ def resolve_model_info [model_alias: string, root_conf: record] {
                     auth_header: $auth_hdr
                     pricing: ($m_info.pricing? | default { input: 0.0, output: 0.0, cache_hit: 0.0 })
                     is_local: ($p_name == "local")
+                    thinking: ($m_info.thinking? | default ($m_info.options?.thinking? | default null))
+                    reasoning_effort: ($m_info.reasoning_effort? | default ($m_info.options?.reasoning_effort? | default null))
                 }
             }
         }
@@ -295,6 +299,8 @@ def load_agent_config [agent_dir: string, root_conf?: record] {
         name: ($agent_dir | path basename)
         description: ""
         default_model: $base_conf.default_model
+        subagents: []
+        supported_models: []
         options: $base_conf.options
         models: $base_conf.models
         system_prompt: ""
@@ -305,6 +311,8 @@ def load_agent_config [agent_dir: string, root_conf?: record] {
         if ($loaded.name? | default "" | is-not-empty) { $agent_conf.name = $loaded.name }
         if ($loaded.description? | default "" | is-not-empty) { $agent_conf.description = $loaded.description }
         if ($loaded.default_model? | default "" | is-not-empty) { $agent_conf.default_model = $loaded.default_model }
+        if ($loaded.subagents? != null) { $agent_conf.subagents = $loaded.subagents }
+        if ($loaded.supported_models? != null) { $agent_conf.supported_models = $loaded.supported_models }
         if ($loaded.options? != null) {
             $agent_conf.options = ($agent_conf.options | merge ($loaded.options | default {}))
         }
@@ -704,6 +712,8 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
         (try { open --raw $mf | lines | length } catch { 0 })
     } else { 0 }
 
+    let final_pos = $pos_args
+    let final_named = $named_args
     let res = if $is_call_agent {
         let target_agent = ($args_dict.agent? | default "")
         let task_str = ($args_dict.task? | default "")
@@ -711,7 +721,9 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
         let out = (do_call_agent $target_agent $task_str $model_str $agent_name)
         { stdout: $out, stderr: "", exit_code: 0 }
     } else {
-        (^nu $tool_path ...$pos_args ...$named_args | complete)
+        with-env { KEN_DEPTH: (($depth + 1) | into string) } {
+            ^nu $tool_path ...$final_pos ...$final_named | complete
+        }
     }
 
     let t_end = (date now)
@@ -745,8 +757,14 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
         $output
     } else {
         tty_report $"($indent)} ($agent_name)/($fn_name) ! exit ($res.exit_code) \((format_duration $t_dur) @ ($time_end_str)\)\n"
-        if not ($res.stderr | is-empty) { tty_report $"($res.stderr)\n" }
-        if not ($res.stdout | is-empty) { tty_report $"($res.stdout)\n" }
+        if not ($res.stderr | is-empty) {
+            let indented_err = ($res.stderr | lines | each { |l| $"($indent)  ($l)" } | str join "\n")
+            tty_report $"($indented_err)\n"
+        }
+        if not ($res.stdout | is-empty) {
+            let indented_out = ($res.stdout | lines | each { |l| $"($indent)  ($l)" } | str join "\n")
+            tty_report $"($indented_out)\n"
+        }
         tty_report "\n"
         $"Error: ($res.stderr)\n($res.stdout)"
     }
@@ -767,6 +785,94 @@ def style_line [text: string, lang: string = "markdown", prefix: string = ""] {
     }
 }
 
+def format_stream_token [tok: string, indent: string, at_start: bool] {
+    if ($tok | is-empty) {
+        return { text: "", at_start: $at_start }
+    }
+    if ($indent | is-empty) {
+        let ends_nl = ($tok | str ends-with "\n")
+        return { text: $tok, at_start: $ends_nl }
+    }
+    let parts = ($tok | split row "\n")
+    let n = ($parts | length)
+    mut out = ""
+    mut cur_start = $at_start
+    for i in 0..<($n) {
+        let p = ($parts | get $i)
+        if $i > 0 {
+            $out = ($out + "\n")
+            $cur_start = true
+        }
+        if not ($p | is-empty) {
+            if $cur_start {
+                $out = ($out + $indent)
+                $cur_start = false
+            }
+            $out = ($out + $p)
+        }
+    }
+    { text: $out, at_start: $cur_start }
+}
+
+def resolve_thinking_payload [think_val: any] {
+    if $think_val == null or ($think_val | into string | is-empty) {
+        return {}
+    }
+    let tv = ($think_val | into string | str lowercase | str trim)
+    if $tv in ["off", "false", "none", "0", "disable", "disabled"] {
+        {
+            chat_template_kwargs: { enable_thinking: false }
+            reasoning_budget: 0
+        }
+    } else if $tv in ["on", "true", "enable", "enabled", "1"] {
+        {
+            chat_template_kwargs: { enable_thinking: true }
+        }
+    } else if $tv in ["low", "medium", "high"] {
+        {
+            chat_template_kwargs: { enable_thinking: true, reasoning_effort: $tv }
+            reasoning_effort: $tv
+        }
+    } else {
+        let num = (try { $tv | into int } catch { null })
+        if $num != null {
+            if $num <= 0 {
+                {
+                    chat_template_kwargs: { enable_thinking: false }
+                    reasoning_budget: 0
+                }
+            } else {
+                {
+                    chat_template_kwargs: { enable_thinking: true }
+                    reasoning_budget: $num
+                }
+            }
+        } else {
+            {
+                chat_template_kwargs: { enable_thinking: true, reasoning_effort: $tv }
+                reasoning_effort: $tv
+            }
+        }
+    }
+}
+
+def apply_thinking_payload [payload: record, think_val: any] {
+    let tp = (resolve_thinking_payload $think_val)
+    if ($tp | is-empty) { return $payload }
+    mut res = $payload
+    if ($tp.chat_template_kwargs? != null) {
+        let existing = ($res.chat_template_kwargs? | default {})
+        $res = ($res | upsert chat_template_kwargs ($existing | merge $tp.chat_template_kwargs))
+    }
+    if ($tp.reasoning_effort? != null) {
+        $res = ($res | upsert reasoning_effort $tp.reasoning_effort)
+    }
+    if ($tp.reasoning_budget? != null) {
+        $res = ($res | upsert reasoning_budget $tp.reasoning_budget)
+    }
+    $res
+}
+
 # Main chat execution loop
 def run_agent [
     spec_str: string
@@ -774,6 +880,7 @@ def run_agent [
     image_path: string = ""
     slot_override: int = -1
     no_md: bool = false
+    think_override: string = ""
 ] {
     let parsed = (parse_spec $spec_str)
     let agent_name = $parsed.agent
@@ -804,6 +911,23 @@ def run_agent [
 
     # Model parameters from cascading config (options + models.<model_id>)
     let model_params = (resolve_model_params $agent_conf $model_alias)
+    let think_setting = (if not ($think_override | is-empty) {
+        $think_override
+    } else if ($model_params.thinking? | default null) != null {
+        $model_params.thinking
+    } else if ($model_params.reasoning_effort? | default null) != null {
+        $model_params.reasoning_effort
+    } else if ($model_info.thinking? | default null) != null {
+        $model_info.thinking
+    } else if ($model_info.reasoning_effort? | default null) != null {
+        $model_info.reasoning_effort
+    } else {
+        ""
+    })
+    mut clean_params = $model_params
+    if ($clean_params.thinking? | default null) != null {
+        $clean_params = ($clean_params | reject thinking)
+    }
 
     # Slot allocation by alphabetical agent index (local only)
     let root = (get_ken_root)
@@ -926,7 +1050,8 @@ def run_agent [
         if $model_info.is_local {
             $payload = ($payload | insert timings_per_token true | insert cache_prompt true | insert id_slot $assigned_slot)
         }
-        $payload = ($payload | merge $model_params)
+        $payload = ($payload | merge $clean_params)
+        $payload = (apply_thinking_payload $payload $think_setting)
         if not ($tools | is-empty) {
             $payload = ($payload | insert tools $tools)
         }
@@ -935,6 +1060,8 @@ def run_agent [
         mut turn_content = ""
         mut turn_reasoning = ""
         mut in_reasoning = false
+        mut reasoning_at_start = true
+        mut non_interactive_at_start = true
         mut tool_deltas = []
         mut known_call_ids = []
         mut current_line = ""
@@ -976,9 +1103,12 @@ def run_agent [
                 if not $in_reasoning {
                     $in_reasoning = true
                     tty_report $"\n($indent)<\n(ansi d)"
+                    $reasoning_at_start = true
                 }
                 $turn_reasoning = ($turn_reasoning + $r_tok)
-                tty_report $r_tok
+                let formatted = (format_stream_token $r_tok $indent $reasoning_at_start)
+                $reasoning_at_start = $formatted.at_start
+                tty_report $formatted.text
             }
 
             let c_tok = ($delta.content? | default "")
@@ -1042,7 +1172,9 @@ def run_agent [
                         }
                     }
                 } else {
-                    tty_report $c_tok
+                    let formatted = (format_stream_token $c_tok $indent $non_interactive_at_start)
+                    $non_interactive_at_start = $formatted.at_start
+                    tty_report $formatted.text
                 }
             }
 
@@ -1522,6 +1654,7 @@ def "main raw" [
     --system (-s): string = ""   # Optional system instructions
     --max-tokens: int = 1024     # Max output tokens
     --temp: float = 0.1          # Sampling temperature
+    --think (-t): string = ""    # Reasoning control: off, low, medium, high, on
 ] {
     let has_stdin = (not (is-terminal --stdin))
     let piped_input = (if $has_stdin { try { open --raw /dev/stdin } catch { "" } } else { "" })
@@ -1543,6 +1676,16 @@ def "main raw" [
     let target_m = if not ($model | is-empty) { $model } else { $root_conf.default_model }
     let model_info = (resolve_model_info $target_m $root_conf)
     let chat_url = $"($model_info.base_url)/chat/completions"
+
+    let think_setting = (if not ($think | is-empty) {
+        $think
+    } else if ($model_info.thinking? | default null) != null {
+        $model_info.thinking
+    } else if ($model_info.reasoning_effort? | default null) != null {
+        $model_info.reasoning_effort
+    } else {
+        ""
+    })
 
     # Setup metrics tracking if not inherited
     let metrics_dir = (get_metrics_dir)
@@ -1573,6 +1716,7 @@ def "main raw" [
     if $model_info.is_local {
         $payload = ($payload | insert timings_per_token true | insert cache_prompt true)
     }
+    $payload = (apply_thinking_payload $payload $think_setting)
 
     let depth = (try { $env.KEN_DEPTH | into int } catch { 0 })
     let indent = ("" | fill -c " " -w ($depth * 2))
@@ -1588,6 +1732,9 @@ def "main raw" [
     $curl_args = ($curl_args | append [-d ($payload | to json -r)])
 
     mut full_content = ""
+    mut full_reasoning = ""
+    mut in_reasoning = false
+    mut at_line_start = true
     mut raw_timings: any = null
     mut raw_usage: any = null
     mut stream_lines = []
@@ -1610,11 +1757,38 @@ def "main raw" [
             $raw_usage = $chunk.usage
         }
 
-        let c_tok = ($chunk.choices?.0?.delta?.content? | default "")
-        if not ($c_tok | is-empty) {
-            $full_content = ($full_content + $c_tok)
-            tty_report $c_tok
+        let delta = ($chunk.choices?.0?.delta? | default {})
+
+        let r_tok = ($delta.reasoning_content? | default "")
+        if not ($r_tok | is-empty) {
+            if not $in_reasoning {
+                $in_reasoning = true
+                tty_report $"\n($indent)<\n(ansi d)"
+                $at_line_start = true
+            }
+            $full_reasoning = ($full_reasoning + $r_tok)
+            let formatted = (format_stream_token $r_tok $indent $at_line_start)
+            $at_line_start = $formatted.at_start
+            tty_report $formatted.text
         }
+
+        let c_tok = ($delta.content? | default "")
+        if not ($c_tok | is-empty) {
+            if $in_reasoning {
+                $in_reasoning = false
+                tty_report $"(ansi reset)\n($indent)>\n\n"
+                $at_line_start = true
+            }
+            $full_content = ($full_content + $c_tok)
+            let formatted = (format_stream_token $c_tok $indent $at_line_start)
+            $at_line_start = $formatted.at_start
+            tty_report $formatted.text
+        }
+    }
+
+    if $in_reasoning {
+        $in_reasoning = false
+        tty_report $"(ansi reset)\n($indent)>\n\n"
     }
 
     if not ($full_content | str ends-with "\n") {
@@ -1868,6 +2042,7 @@ def main [
     query?: string
     --image (-i): string = ""
     --slot: int = -1
+    --think (-t): string = ""
     --no-md
 ] {
     let has_stdin = (not (is-terminal --stdin))
@@ -1883,8 +2058,14 @@ def main [
         print "  ken md [file]             Display colored markdown"
         print "  ken schema [agent]        Dump OpenAI tools schema"
         print "  ken session [list|clear]  Manage persistent sessions"
+        print "\nOptions:"
+        print "  -t, --think <level>       Reasoning control: off, low, medium, high, on"
+        print "  -i, --image <path>        Pass image for multimodal models"
+        print "      --slot <id>           Force llama-server KV slot ID"
+        print "      --no-md               Disable interactive bat markdown rendering"
         print "\nExamples:"
         print "  ken 1qwent 'Solve step by step'"
+        print "  ken -t off q 'Give me 3 bullet points'"
         print "  ken notes.lfm 'What is a PCB?'"
         print "  ken tok '~/Documents/notes/**/*.typ'"
         print "  . <(ken setup $SHELL ~/.config/ken)"
@@ -1905,5 +2086,5 @@ def main [
         return
     }
 
-    run_agent $spec $full_query $image $slot $no_md
+    run_agent $spec $full_query $image $slot $no_md $think
 }
