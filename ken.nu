@@ -1081,10 +1081,6 @@ def run_agent [
         mut current_line = ""
         mut stream_lines = []
 
-        if $is_interactive {
-            tty_report "\e7" # Save cursor at start of first line
-        }
-
         mut curl_args = [-s -N --no-buffer $chat_url -H "Content-Type: application/json"]
         if ($model_info.auth_header? | default null) != null {
             $curl_args = ($curl_args | append [-H $"Authorization: ($model_info.auth_header)"])
@@ -1135,64 +1131,14 @@ def run_agent [
             if $in_reasoning and ((not ($c_tok | is-empty)) or (not ($tc | is-empty))) {
                 $in_reasoning = false
                 tty_report $"(ansi reset)\n\n"
-                if $is_interactive {
-                    tty_report "\e7"
-                }
             }
 
-            # Content tokens (progressive bat line highlighting with cursor restore)
+            # Content tokens (stream directly with proper indent and terminal wrapping)
             if not ($c_tok | is-empty) {
                 $turn_content = ($turn_content + $c_tok)
-                if $is_interactive {
-                    if ($c_tok | str contains "\n") {
-                        let parts = ($c_tok | split row "\n")
-                        let p_count = ($parts | length)
-                        for idx in 0..($p_count - 1) {
-                            let part = ($parts | get $idx)
-                            $current_line = ($current_line + $part)
-                            if $idx < ($p_count - 1) {
-                                # Newline reached: style line with bat, commit newline, save cursor for next line
-                                let styled = (style_line $current_line "markdown" $indent)
-                                let term_cols = (try { term size | get columns } catch { 80 })
-                                let line_len = (($indent + $current_line) | str length)
-                                let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
-                                if $lines_up > 0 {
-                                    tty_report $"\e[($lines_up)A\r\e[0J($styled)\n\e7"
-                                } else {
-                                    tty_report $"\e8\e[0J($styled)\n\e7"
-                                }
-                                $current_line = ""
-                            } else if not ($current_line | is-empty) {
-                                # Partial line after newline: restore cursor and style
-                                let styled = (style_line $current_line "markdown" $indent)
-                                let term_cols = (try { term size | get columns } catch { 80 })
-                                let line_len = (($indent + $current_line) | str length)
-                                let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
-                                if $lines_up > 0 {
-                                    tty_report $"\e[($lines_up)A\r\e[0J($styled)"
-                                } else {
-                                    tty_report $"\e8\e[0J($styled)"
-                                }
-                            }
-                        }
-                    } else {
-                        # Token in current line: restore cursor, clear to end of screen and highlight with bat
-                        $current_line = ($current_line + $c_tok)
-                        let styled = (style_line $current_line "markdown" $indent)
-                        let term_cols = (try { term size | get columns } catch { 80 })
-                        let line_len = (($indent + $current_line) | str length)
-                        let lines_up = (if $term_cols > 0 and $line_len > 0 { ($line_len - 1) // $term_cols } else { 0 })
-                        if $lines_up > 0 {
-                            tty_report $"\e[($lines_up)A\r\e[0J($styled)"
-                        } else {
-                            tty_report $"\e8\e[0J($styled)"
-                        }
-                    }
-                } else {
-                    let formatted = (format_stream_token $c_tok $indent $non_interactive_at_start)
-                    $non_interactive_at_start = $formatted.at_start
-                    tty_report $formatted.text
-                }
+                let formatted = (format_stream_token $c_tok $indent $non_interactive_at_start)
+                $non_interactive_at_start = $formatted.at_start
+                tty_report $formatted.text
             }
 
             # Tool call deltas
@@ -1253,6 +1199,11 @@ def run_agent [
         let pred_n = ($turn_timings.predicted_n? | default ($turn_usage.completion_tokens? | default 0))
         let ttft_ms = ($turn_timings.prompt_ms? | default 0 | math round)
         let gen_tps = ($turn_timings.predicted_per_second? | default 0 | into float | math round -p 1)
+        let pp_tps = if $ttft_ms > 0 and $prompt_n > 0 {
+            ($prompt_n * 1000.0 / $ttft_ms | math round -p 1)
+        } else {
+            0.0
+        }
 
         $total_prompt_tokens = ($total_prompt_tokens + $prompt_n)
         $total_pred_tokens = ($total_pred_tokens + $pred_n)
@@ -1283,7 +1234,13 @@ def run_agent [
             })
             $banner_parts = ($banner_parts | append $ctx_info)
             if $ttft_ms > 0 {
-                $banner_parts = ($banner_parts | append (format_ms $ttft_ms))
+                let ttft_str = (format_ms $ttft_ms)
+                let ttft_with_pp = if $pp_tps > 0 {
+                    $"($ttft_str) \(($pp_tps) pp t/s\)"
+                } else {
+                    $ttft_str
+                }
+                $banner_parts = ($banner_parts | append $ttft_with_pp)
             }
             if $gen_tps > 0 {
                 $banner_parts = ($banner_parts | append $"($gen_tps) t/s")
@@ -1830,6 +1787,11 @@ def "main raw" [
     let cache_n = ($raw_timings.cache_n? | default ($raw_usage.prompt_tokens_details?.cached_tokens? | default 0))
     let ttft_ms = ($raw_timings.prompt_ms? | default 0 | math round)
     let gen_tps = ($raw_timings.predicted_per_second? | default 0 | into float | math round -p 1)
+    let pp_tps = if $ttft_ms > 0 and $prompt_n > 0 {
+        ($prompt_n * 1000.0 / $ttft_ms | math round -p 1)
+    } else {
+        0.0
+    }
     let n_lines = ($full_content | lines | length)
 
     let currency = ($root_conf.currency? | default "$")
@@ -1856,7 +1818,13 @@ def "main raw" [
     }
     mut raw_parts = [$ctx_str]
     if $ttft_ms > 0 {
-        $raw_parts = ($raw_parts | append (format_ms $ttft_ms))
+        let ttft_str = (format_ms $ttft_ms)
+        let ttft_with_pp = if $pp_tps > 0 {
+            $"($ttft_str) \(($pp_tps) pp t/s\)"
+        } else {
+            $ttft_str
+        }
+        $raw_parts = ($raw_parts | append $ttft_with_pp)
     }
     let speed_and_out = if $gen_tps > 0 {
         $"($gen_tps) t/s -> ($n_lines)L ($pred_n)t \(((format_duration $t_dur)) @ ($time_now)\)"
