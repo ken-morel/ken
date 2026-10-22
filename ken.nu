@@ -6,12 +6,23 @@ def get_ken_root [] {
         return $env.KEN_ROOT
     }
     let script_dir = ($env.FILE_PWD? | default "")
-    if not ($script_dir | is-empty) and ($script_dir | path exists) {
+    if not ($script_dir | is-empty) and (($script_dir | path join "config.nuon") | path exists) {
         return $script_dir
     }
+    # Resolve symlinks if script was invoked via ~/bin or PATH
+    let current_file = ($env.CURRENT_FILE? | default "")
+    if not ($current_file | is-empty) and ($current_file | path exists) {
+        let real_dir = (try { $current_file | path expand | path dirname } catch { "" })
+        if not ($real_dir | is-empty) and (($real_dir | path join "config.nuon") | path exists) {
+            return $real_dir
+        }
+    }
     let home_ken = ($env.HOME | path join "ken")
-    if ($home_ken | path exists) {
+    if (($home_ken | path join "config.nuon") | path exists) {
         return $home_ken
+    }
+    if not ($script_dir | is-empty) and ($script_dir | path exists) {
+        return $script_dir
     }
     $env.PWD
 }
@@ -792,8 +803,9 @@ def run_agent [
 
     # Slot allocation by alphabetical agent index (local only)
     let root = (get_ken_root)
-    let all_agents = (ls $root | where type == dir and (not ($it.name | path basename | str starts-with ".")) and ($it.name | path basename) != "bin" | get name | each { path basename } | sort)
-    let agent_idx = ($all_agents | enumerate | where item == $agent_name | get 0.index? | default 0)
+    let all_agents = (try { ls $root | where type == dir and (not ($it.name | path basename | str starts-with ".")) and ($it.name | path basename) != "bin" | get name | each { path basename } | sort } catch { [] })
+    let match_row = ($all_agents | enumerate | where item == $agent_name)
+    let agent_idx = (if ($match_row | is-empty) { 0 } else { $match_row | first | get index })
     let assigned_slot = (if $slot_override >= 0 { $slot_override } else { $agent_idx mod 2 })
 
     # Slot snapshot check: restore if cached and up-to-date with agent prompt/config (local only)
