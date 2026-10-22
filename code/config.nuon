@@ -1,5 +1,0 @@
-{
-    name: "code"
-    description: "Python execution, mathematical calculation, and script evaluation"
-    default_model: "q"
-}

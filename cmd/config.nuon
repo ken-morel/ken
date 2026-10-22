@@ -1,5 +1,0 @@
-{
-    name: "cmd"
-    description: "Zsh command generation & explanation specialist for Arch Linux"
-    default_model: "q"
-}

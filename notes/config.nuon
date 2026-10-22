@@ -1,5 +1,0 @@
-{
-    name: "notes"
-    description: "Academic & coursework notes specialist, can browse, search and read the user's 'notes'"
-    default_model: "q"
-}

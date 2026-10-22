@@ -2,29 +2,32 @@
 # Ken - Local Agentic Assistant in pure Nushell
 
 def get_ken_root [] {
-    if not ($env.KEN_ROOT? | default "" | is-empty) and ($env.KEN_ROOT | path exists) {
-        return $env.KEN_ROOT
+    # 1. Explicit environment variable set by shell / ken setup
+    if not ($env.KEN_DIR? | default "" | is-empty) and ($env.KEN_DIR | path exists) {
+        return ($env.KEN_DIR | path expand)
     }
+    if not ($env.KEN_ROOT? | default "" | is-empty) and ($env.KEN_ROOT | path exists) {
+        return ($env.KEN_ROOT | path expand)
+    }
+    # 2. XDG user config directory (~/.config/ken)
+    let xdg_dir = (if not ($env.XDG_CONFIG_HOME? | default "" | is-empty) {
+        $env.XDG_CONFIG_HOME | path join "ken"
+    } else {
+        $env.HOME | path join ".config" "ken"
+    })
+    if (($xdg_dir | path join "config.nuon") | path exists) {
+        return $xdg_dir
+    }
+    # 3. Directory containing the script (for portable standalone copies)
     let script_dir = ($env.FILE_PWD? | default "")
     if not ($script_dir | is-empty) and (($script_dir | path join "config.nuon") | path exists) {
         return $script_dir
     }
-    # Resolve symlinks if script was invoked via ~/bin or PATH
-    let current_file = ($env.CURRENT_FILE? | default "")
-    if not ($current_file | is-empty) and ($current_file | path exists) {
-        let real_dir = (try { $current_file | path expand | path dirname } catch { "" })
-        if not ($real_dir | is-empty) and (($real_dir | path join "config.nuon") | path exists) {
-            return $real_dir
-        }
+    # 4. Current working directory
+    if (($env.PWD | path join "config.nuon") | path exists) {
+        return $env.PWD
     }
-    let home_ken = ($env.HOME | path join "ken")
-    if (($home_ken | path join "config.nuon") | path exists) {
-        return $home_ken
-    }
-    if not ($script_dir | is-empty) and ($script_dir | path exists) {
-        return $script_dir
-    }
-    $env.PWD
+    $xdg_dir
 }
 
 def get_local_url [endpoint: string = "", root_conf?: record] {
@@ -408,12 +411,9 @@ def get_agent_tools [agent_dir: string] {
         })
     }
 
-    # Auto-generate call_agent tool if agent has callable subagents (via *.k symlinks or subagents in config.nuon)
-    let available_k = (glob ($agent_dir | path join "*.k") | sort)
+    # Auto-generate call_agent tool if agent has callable subagents declared in config.nuon
     let agent_conf = (load_agent_config $agent_dir)
-    let subagents_cfg = ($agent_conf.subagents? | default [])
-    let k_agents = ($available_k | each { path parse | get stem })
-    let available_agents = ($k_agents | append $subagents_cfg | uniq | sort)
+    let available_agents = ($agent_conf.subagents? | default [] | uniq | sort)
 
     if not ($available_agents | is-empty) {
         let agent_docs = ($available_agents | each { |a_name|
@@ -491,12 +491,10 @@ def do_call_agent [
     let caller_name = (if not ($caller_agent | is-empty) { $caller_agent } else { $env.KEN_AGENT? | default $def_agent })
     let caller_dir = (resolve_agent_dir $caller_name)
 
-    # Resolve target agent: must exist as <caller_dir>/<agent>.k or be declared in subagents
-    let agent_k = ($caller_dir | path join $"($agent).k")
-    let has_k = ($agent_k | path exists)
+    # Resolve target agent: must be declared in caller's subagents
     let caller_conf = (load_agent_config $caller_dir)
     let allowed_subagents = ($caller_conf.subagents? | default [])
-    let is_allowed = $has_k or ($agent in $allowed_subagents)
+    let is_allowed = ($agent in $allowed_subagents)
 
     if not $is_allowed {
         return $"Error: Agent '($agent)' is not available in ($caller_name)."
@@ -1748,6 +1746,117 @@ def "main session" [
     }
 }
 
+# Subcommand: setup (Generate shell configuration snippet)
+def "main setup" [
+    shell_name?: string
+    config_dir?: string
+] {
+    let sh = (if not ($shell_name | is-empty) {
+        $shell_name | path basename
+    } else if not ($env.SHELL? | default "" | is-empty) {
+        $env.SHELL | path basename
+    } else {
+        "zsh"
+    })
+    
+    let default_cfg = (if not ($env.XDG_CONFIG_HOME? | default "" | is-empty) {
+        $env.XDG_CONFIG_HOME | path join "ken"
+    } else {
+        $env.HOME | path join ".config" "ken"
+    })
+    let target_dir = (if not ($config_dir | is-empty) {
+        $config_dir | path expand
+    } else {
+        $default_cfg
+    })
+
+    match $sh {
+        "zsh" => {
+            let zsh_lines = [
+                '# Ken shell integration for zsh'
+                $"export KEN_DIR=\"($target_dir)\""
+                $"export KEN_ROOT=\"($target_dir)\""
+                ''
+                'if [[ -n "$ZSH_VERSION" ]]; then'
+                '    _ken_execute_widget() {'
+                '        local input_text="$BUFFER"'
+                '        if [[ -z "${input_text//[[:space:]]/}" ]]; then'
+                "            printf '\\a'"
+                '            return'
+                '        fi'
+                ''
+                "        # 1. Starts with '#' -> Generate command"
+                "        if [[ \"$input_text\" =~ '^[[:space:]]*#' ]]; then"
+                '            local prompt="${input_text#*#}"'
+                '            zle -I'
+                '            local gen_cmd'
+                '            gen_cmd=$(ken cmd.q "GENERATE: $prompt" 2>/dev/null)'
+                '            if [[ -n "$gen_cmd" ]]; then'
+                '                BUFFER="$gen_cmd"'
+                '                CURSOR=${#BUFFER}'
+                '            else'
+                "                printf '\\a'"
+                '            fi'
+                '            zle reset-prompt'
+                ''
+                "        # 2. Contains '#' inside -> Modify base command with instruction"
+                '        elif [[ "$input_text" == *#* ]]; then'
+                '            local base_cmd="${input_text%%#*}"'
+                '            local instruction="${input_text#*#}"'
+                '            zle -I'
+                '            local gen_cmd'
+                '            gen_cmd=$(ken cmd.q "MODIFY: Base command: '\''${base_cmd%% }'\'' | Instruction: '\''${instruction## }'\''" 2>/dev/null)'
+                '            if [[ -n "$gen_cmd" ]]; then'
+                '                BUFFER="$gen_cmd"'
+                '                CURSOR=${#BUFFER}'
+                '            else'
+                "                printf '\\a'"
+                '            fi'
+                '            zle reset-prompt'
+                ''
+                "        # 3. Ends with ';' -> Explain command in detail"
+                "        elif [[ \"$input_text\" =~ ';[[:space:]]*$' ]]; then"
+                '            zle -I'
+                '            ken cmd.q "EXPLAIN: $input_text"'
+                '            zle reset-prompt'
+                ''
+                '        # 4. Neither format matches -> Bell / do nothing'
+                '        else'
+                "            printf '\\a'"
+                '        fi'
+                '    }'
+                '    zle -N _ken_execute_widget'
+                "    bindkey '^[e' _ken_execute_widget"
+                'fi'
+            ]
+            print ($zsh_lines | str join (char nl))
+        }
+        "bash" => {
+            print $"# Ken shell integration for bash
+export KEN_DIR=\"($target_dir)\"
+export KEN_ROOT=\"($target_dir)\"
+"
+        }
+        "fish" => {
+            print $"# Ken shell integration for fish
+set -gx KEN_DIR \"($target_dir)\"
+set -gx KEN_ROOT \"($target_dir)\"
+"
+        }
+        "nu" => {
+            print $"# Ken shell integration for nushell
+$env.KEN_DIR = \"($target_dir)\"
+$env.KEN_ROOT = \"($target_dir)\"
+"
+        }
+        _ => {
+            print $"export KEN_DIR=\"($target_dir)\"
+export KEN_ROOT=\"($target_dir)\"
+"
+        }
+    }
+}
+
 # Default main entrypoint
 def main [
     spec?: string
@@ -1762,6 +1871,7 @@ def main [
         print "Usage: ken [session][agent.]<model> [query] [options]"
         print "       ken <subcommand>"
         print "\nSubcommands:"
+        print "  ken setup [shell] [dir]   Emit shell integration snippet"
         print "  ken list                  List agents, default models, and tools"
         print "  ken prefill [agent]       Pre-evaluate & save prompt snapshots"
         print "  ken tok [patterns...]     Count tokens via llama.cpp"
@@ -1772,6 +1882,7 @@ def main [
         print "  ken 1qwent 'Solve step by step'"
         print "  ken notes.lfm 'What is a PCB?'"
         print "  ken tok '~/Documents/notes/**/*.typ'"
+        print "  . <(ken setup $SHELL ~/.config/ken)"
         return
     }
 

@@ -1,5 +1,0 @@
-{
-    name: "sys"
-    description: "System & hardware telemetry (CPU, GPU, RAM, disk, temps, load) and desktop notifications. (Cannot check files or run shell commands)"
-    default_model: "l"
-}

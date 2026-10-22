@@ -1,5 +1,0 @@
-{
-    name: "voice"
-    description: "Text-to-speech audio synthesis and reading aloud"
-    default_model: "l"
-}

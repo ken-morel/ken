@@ -1,5 +1,0 @@
-{
-    name: "media"
-    description: "Local SD-Turbo image generation and style prompting"
-    default_model: "q"
-}

@@ -1,5 +1,0 @@
-{
-    name: "task"
-    description: "Background process manager using systemd-run transient user cgroups"
-    default_model: "adc"
-}

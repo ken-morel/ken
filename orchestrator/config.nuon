@@ -1,5 +1,0 @@
-{
-    name: "orchestrator"
-    description: "Central intelligence, task coordination, and general assistance"
-    default_model: "q"
-}
