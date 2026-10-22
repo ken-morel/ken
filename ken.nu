@@ -770,21 +770,6 @@ def execute_tool [agent_dir: string, fn_name: string, args_json: string] {
     }
 }
 
-def style_line [text: string, lang: string = "markdown", prefix: string = ""] {
-    if ($text | is-empty) { return "" }
-    let res = ($text | ^bat --plain --paging=never --color=always -l $lang | complete)
-    let rendered = if $res.exit_code == 0 {
-        $res.stdout | str trim -r -c "\n"
-    } else {
-        $text
-    }
-    if not ($prefix | is-empty) {
-        $rendered | lines | each { |l| $"($prefix)($l)" } | str join "\n"
-    } else {
-        $rendered
-    }
-}
-
 def format_stream_token [
     tok: string
     indent: string
@@ -1469,36 +1454,6 @@ def "main tok" [
     print ("Total: " + ($results | length | into string) + " files | " + ($total_sz | into string) + " | " + ($total_tokens | into string) + " tokens (" + ($pct | into string) + "% of " + ($model_ctx | into string) + " ctx [" + $target_model + "])")
 }
 
-# Subcommand: md (Displays colored markdown)
-def "main md" [
-    file?: string
-    --lang (-l): string = "markdown"
-    --prefix (-p): string = ""
-] {
-    let has_stdin = (not (is-terminal --stdin))
-    let raw_content = if not ($file | is-empty) and ($file | path exists) {
-        open --raw $file
-    } else if $has_stdin {
-        try { open --raw /dev/stdin } catch { "" }
-    } else {
-        print "Usage: ken md [file.md] [--prefix '  ']"
-        print "       cat file.md | ken md"
-        return
-    }
-
-    let rendered = (try {
-        $raw_content | ^bat --plain --paging=never --color=always -l $lang | complete | get stdout
-    } catch {
-        $raw_content
-    })
-
-    if not ($prefix | is-empty) {
-        $rendered | lines | each { |l| $"($prefix)($l)" } | str join "\n" | print
-    } else {
-        print -n $rendered
-    }
-}
-
 # Subcommand: list (List agents, models, and providers)
 def "main list" [] {
     let root = (get_ken_root)
@@ -2043,14 +1998,13 @@ def main [
         print "  ken list                  List agents, default models, and tools"
         print "  ken prefill [agent]       Pre-evaluate & save prompt snapshots"
         print "  ken tok [patterns...]     Count tokens via llama.cpp"
-        print "  ken md [file]             Display colored markdown"
         print "  ken schema [agent]        Dump OpenAI tools schema"
         print "  ken session [list|clear]  Manage persistent sessions"
         print "\nOptions:"
         print "  -t, --think <level>       Reasoning control: off, low, medium, high, on"
         print "  -i, --image <path>        Pass image for multimodal models"
         print "      --slot <id>           Force llama-server KV slot ID"
-        print "      --no-md               Disable interactive bat markdown rendering"
+        print "      --no-md               Disable telemetry header/footer banners"
         print "\nExamples:"
         print "  ken 1qwent 'Solve step by step'"
         print "  ken -t off q 'Give me 3 bullet points'"
