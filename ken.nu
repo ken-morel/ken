@@ -785,11 +785,17 @@ def style_line [text: string, lang: string = "markdown", prefix: string = ""] {
     }
 }
 
-def format_stream_token [tok: string, indent: string, at_start: bool] {
+def format_stream_token [
+    tok: string
+    indent: string
+    at_start: bool
+    prefix: string = ""
+    color: string = ""
+] {
     if ($tok | is-empty) {
         return { text: "", at_start: $at_start }
     }
-    if ($indent | is-empty) {
+    if ($indent | is-empty) and ($prefix | is-empty) and ($color | is-empty) {
         let ends_nl = ($tok | str ends-with "\n")
         return { text: $tok, at_start: $ends_nl }
     }
@@ -797,18 +803,26 @@ def format_stream_token [tok: string, indent: string, at_start: bool] {
     let n = ($parts | length)
     mut out = ""
     mut cur_start = $at_start
+    let reset = (ansi reset)
+    let line_pfx = $"($indent)($prefix)($color)"
+    
     for i in 0..<($n) {
         let p = ($parts | get $i)
         if $i > 0 {
+            if not ($color | is-empty) {
+                $out = ($out + $reset)
+            }
             $out = ($out + "\n")
             $cur_start = true
         }
         if not ($p | is-empty) {
             if $cur_start {
-                $out = ($out + $indent)
+                $out = ($out + $line_pfx)
                 $cur_start = false
             }
             $out = ($out + $p)
+        } else if $i > 0 and $i < ($n - 1) and (not ($prefix | is-empty)) {
+            $out = ($out + $"($indent)($prefix)")
         }
     }
     { text: $out, at_start: $cur_start }
@@ -1102,11 +1116,14 @@ def run_agent [
             if not ($r_tok | is-empty) {
                 if not $in_reasoning {
                     $in_reasoning = true
-                    tty_report $"\n($indent)<\n(ansi d)"
+                    tty_report "\n"
                     $reasoning_at_start = true
                 }
                 $turn_reasoning = ($turn_reasoning + $r_tok)
-                let formatted = (format_stream_token $r_tok $indent $reasoning_at_start)
+                let think_prefix_char = ($root_conf.thinking_prefix? | default "│ ")
+                let think_pfx = $"((ansi dark_gray))($think_prefix_char)"
+                let think_col = (ansi dark_gray)
+                let formatted = (format_stream_token $r_tok $indent $reasoning_at_start $think_pfx $think_col)
                 $reasoning_at_start = $formatted.at_start
                 tty_report $formatted.text
             }
@@ -1114,10 +1131,10 @@ def run_agent [
             let c_tok = ($delta.content? | default "")
             let tc = ($delta.tool_calls? | default [])
 
-            # Close reasoning tag when transitioning to content or tools
+            # Close reasoning when transitioning to content or tools
             if $in_reasoning and ((not ($c_tok | is-empty)) or (not ($tc | is-empty))) {
                 $in_reasoning = false
-                tty_report $"(ansi reset)\n($indent)>\n\n"
+                tty_report $"(ansi reset)\n\n"
                 if $is_interactive {
                     tty_report "\e7"
                 }
@@ -1204,7 +1221,7 @@ def run_agent [
 
         if $in_reasoning {
             $in_reasoning = false
-            tty_report $"(ansi reset)\n($indent)>\n\n"
+            tty_report $"(ansi reset)\n\n"
         }
 
         if $is_interactive and not ($current_line | is-empty) {
@@ -1763,11 +1780,14 @@ def "main raw" [
         if not ($r_tok | is-empty) {
             if not $in_reasoning {
                 $in_reasoning = true
-                tty_report $"\n($indent)<\n(ansi d)"
+                tty_report "\n"
                 $at_line_start = true
             }
             $full_reasoning = ($full_reasoning + $r_tok)
-            let formatted = (format_stream_token $r_tok $indent $at_line_start)
+            let think_prefix_char = ($root_conf.thinking_prefix? | default "│ ")
+            let think_pfx = $"((ansi dark_gray))($think_prefix_char)"
+            let think_col = (ansi dark_gray)
+            let formatted = (format_stream_token $r_tok $indent $at_line_start $think_pfx $think_col)
             $at_line_start = $formatted.at_start
             tty_report $formatted.text
         }
@@ -1776,7 +1796,7 @@ def "main raw" [
         if not ($c_tok | is-empty) {
             if $in_reasoning {
                 $in_reasoning = false
-                tty_report $"(ansi reset)\n($indent)>\n\n"
+                tty_report $"(ansi reset)\n\n"
                 $at_line_start = true
             }
             $full_content = ($full_content + $c_tok)
@@ -1788,7 +1808,7 @@ def "main raw" [
 
     if $in_reasoning {
         $in_reasoning = false
-        tty_report $"(ansi reset)\n($indent)>\n\n"
+        tty_report $"(ansi reset)\n\n"
     }
 
     if not ($full_content | str ends-with "\n") {
@@ -1799,7 +1819,7 @@ def "main raw" [
     let time_now = (date now | format date "%H:%M:%S")
 
     # If stream failed, print error to stderr
-    if ($full_content | is-empty) and (not ($stream_lines | is-empty)) {
+    if ($full_content | is-empty) and ($full_reasoning | is-empty) and (not ($stream_lines | is-empty)) {
         let err_raw = ($stream_lines | str join "\n")
         print -e $"\n(ansi red_bold)[Ken Raw Error](ansi reset) Request to ($chat_url) failed:\n($err_raw)"
         return
