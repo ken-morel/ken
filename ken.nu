@@ -142,26 +142,42 @@ def resolve_model_info [model_alias: string, root_conf: record] {
     }
 }
 
-def calculate_cost [pricing: record, prompt_tokens: int, completion_tokens: int, cached_tokens: int, rate_to_cfa: float = 584.0] {
+def format_cost [amount: float, currency: string = "$"] {
+    if $amount == 0.0 {
+        return (match $currency {
+            "$" => "$0"
+            "€" => "0€"
+            "£" => "£0"
+            "¥" => "¥0"
+            _ => $"0 ($currency)"
+        })
+    }
+    let rounded = if $amount < 0.0001 and $amount > 0.0 {
+        ($amount | math round -p 6)
+    } else {
+        ($amount | math round -p 4)
+    }
+    match $currency {
+        "$" | "£" | "¥" => $"($currency)($rounded)"
+        "€" => $"($rounded)€"
+        _ => $"($rounded) ($currency)"
+    }
+}
+
+def calculate_cost [pricing: record, prompt_tokens: int, completion_tokens: int, cached_tokens: int, currency: string = "$"] {
     let in_price = ($pricing.input? | default 0.0 | into float)
     let out_price = ($pricing.output? | default 0.0 | into float)
     let cache_price = ($pricing.cache_hit? | default 0.0 | into float)
 
     let uncached_prompt = (if $prompt_tokens >= $cached_tokens { $prompt_tokens - $cached_tokens } else { $prompt_tokens })
-    let cost_usd = (($uncached_prompt / 1000000.0) * $in_price) + (($completion_tokens / 1000000.0) * $out_price) + (($cached_tokens / 1000000.0) * $cache_price)
-    let cost_cfa = ($cost_usd * $rate_to_cfa)
+    let cost = (($uncached_prompt / 1000000.0) * $in_price) + (($completion_tokens / 1000000.0) * $out_price) + (($cached_tokens / 1000000.0) * $cache_price)
 
-    let usd_str = (if $cost_usd < 0.0001 and $cost_usd > 0.0 {
-        $"$($cost_usd | math round -p 6)"
-    } else {
-        $"$($cost_usd | math round -p 4)"
-    })
-    let cfa_str = $"($cost_cfa | math round -p 2) CFA"
+    let label = (format_cost $cost $currency)
 
     {
-        usd: $cost_usd
-        cfa: $cost_cfa
-        label: $"($usd_str) \(($cfa_str)\)"
+        amount: $cost
+        currency: $currency
+        label: $label
         is_free: ($in_price == 0.0 and $out_price == 0.0)
     }
 }
@@ -555,40 +571,30 @@ def record_metric [item: record] {
     }
 }
 
-def get_cumulative_cost [] {
+def get_cumulative_cost [currency: string = "$"] {
     let f = ($env.KEN_METRICS_FILE? | default "")
     if ($f | is-not-empty) and ($f | path exists) {
         let rows = (try { open --raw $f | lines | where ($it | is-not-empty) | each { from json } } catch { [] })
         if not ($rows | is-empty) {
-            let sum_usd = ($rows | get cost_usd | math sum)
-            let sum_cfa = ($rows | get cost_cfa | math sum)
-            return { usd: $sum_usd, cfa: $sum_cfa }
+            let sum_amount = ($rows | each { |r| ($r.cost? | default ($r.cost_usd? | default 0.0) | into float) } | math sum)
+            return { amount: $sum_amount, currency: $currency }
         }
     }
-    { usd: 0.0, cfa: 0.0 }
+    { amount: 0.0, currency: $currency }
 }
 
 def format_cost_label [cost_res: record, cum_cost: record] {
-    if ($cost_res.usd == 0.0 or $cost_res.is_free) and ($cum_cost.usd == 0.0) {
-        return "$0"
+    let cur = ($cost_res.currency? | default "$")
+    if ($cost_res.amount == 0.0 or $cost_res.is_free) and ($cum_cost.amount == 0.0) {
+        return (format_cost 0.0 $cur)
     }
-    let u_turn = if ($cost_res.usd == 0.0 or $cost_res.is_free) {
-        "$0"
-    } else if $cost_res.usd < 0.0001 {
-        $"$($cost_res.usd | math round -p 6)"
+    let u_turn = (format_cost $cost_res.amount $cur)
+    let u_tot = (format_cost $cum_cost.amount $cur)
+    if $u_turn == $u_tot {
+        $u_tot
     } else {
-        $"$($cost_res.usd | math round -p 4)"
+        $"($u_turn) \(tot: ($u_tot)\)"
     }
-
-    let u_tot = if $cum_cost.usd == 0.0 {
-        "$0"
-    } else if $cum_cost.usd < 0.0001 {
-        $"$($cum_cost.usd | math round -p 6)"
-    } else {
-        $"$($cum_cost.usd | math round -p 4)"
-    }
-    let cfa_tot = $"($cum_cost.cfa | math round -p 1) CFA"
-    $"($u_turn) \(tot: ($u_tot) / ($cfa_tot)\)"
 }
 
 def format_ms [ms: int] {
@@ -1104,8 +1110,8 @@ def run_agent [
         $total_cached_tokens = ($total_cached_tokens + $cache_n)
 
         # Cost calculation & metrics recording
-        let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
-        let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
+        let currency = ($root_conf.currency? | default "$")
+        let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $currency)
         record_metric {
             source: $"($agent_name)"
             model: $model_alias
@@ -1113,10 +1119,10 @@ def run_agent [
             prompt_tokens: $prompt_n
             completion_tokens: $pred_n
             cached_tokens: $cache_n
-            cost_usd: $cost_res.usd
-            cost_cfa: $cost_res.cfa
+            cost: $cost_res.amount
+            currency: $currency
         }
-        let cum_cost = (get_cumulative_cost)
+        let cum_cost = (get_cumulative_cost $currency)
         let cost_str = (format_cost_label $cost_res $cum_cost)
 
         if ($turn_timings != null or $turn_usage != null) {
@@ -1234,20 +1240,19 @@ def run_agent [
         if not ($metric_rows | is-empty) {
             let total_p = ($metric_rows | get prompt_tokens | math sum)
             let total_c = ($metric_rows | get completion_tokens | math sum)
-            let total_usd = ($metric_rows | get cost_usd | math sum)
-            let total_cfa = ($metric_rows | get cost_cfa | math sum)
+            let total_cost = ($metric_rows | each { |r| ($r.cost? | default ($r.cost_usd? | default 0.0) | into float) } | math sum)
             let total_dur = ((date now) - $t_run_start)
             let time_str = (date now | format date "%H:%M:%S")
+            let currency = ($root_conf.currency? | default "$")
 
             mut summary_parts = [$"($agent_name).($model_alias)"]
             $summary_parts = ($summary_parts | append $"($total_p + $total_c)t \(($total_p)in, ($total_c)out\)")
             $summary_parts = ($summary_parts | append $"((format_duration $total_dur)) @ ($time_str)")
-            if $total_usd > 0.0 {
-                let u_str = (if $total_usd < 0.0001 { $"$($total_usd | math round -p 6)" } else { $"$($total_usd | math round -p 4)" })
-                let c_str = $"($total_cfa | math round -p 1) CFA"
-                $summary_parts = ($summary_parts | append $"tot: ($u_str) \(($c_str)\)")
+            if $total_cost > 0.0 {
+                let c_str = (format_cost $total_cost $currency)
+                $summary_parts = ($summary_parts | append $"tot: ($c_str)")
             } else {
-                $summary_parts = ($summary_parts | append "tot: $0")
+                $summary_parts = ($summary_parts | append $"tot: (format_cost 0.0 $currency)")
             }
 
             let inner = ($summary_parts | str join " | ")
@@ -1392,9 +1397,9 @@ def "main md" [
 def "main list" [] {
     let root = (get_ken_root)
     let root_conf = (load_root_config)
-    let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
+    let currency = ($root_conf.currency? | default "$")
 
-    print $"Ken Providers & Models [rate: 1 USD = ($rate_cfa) CFA]:\n"
+    print $"Ken Providers & Models:\n"
     let providers = ($root_conf.providers? | default {})
     for p_name in ($providers | columns) {
         let p_data = ($providers | get $p_name)
@@ -1410,7 +1415,7 @@ def "main list" [] {
             let pricing_str = (if $p_in == 0.0 and $p_out == 0.0 {
                 "free"
             } else {
-                $"in: \$($p_in)/1M, out: \$($p_out)/1M"
+                $"in: (format_cost $p_in $currency)/1M, out: (format_cost $p_out $currency)/1M"
             })
             print $"    - \e[1;32m($m_alias)\e[0m -> ($m_name) [($m_ctx) ctx] \(($pricing_str)\) - ($m_desc)"
         }
@@ -1633,8 +1638,8 @@ def "main raw" [
     let gen_tps = ($raw_timings.predicted_per_second? | default 0 | into float | math round -p 1)
     let n_lines = ($full_content | lines | length)
 
-    let rate_cfa = ($root_conf.rate_to_cfa? | default 584.0)
-    let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $rate_cfa)
+    let currency = ($root_conf.currency? | default "$")
+    let cost_res = (calculate_cost $model_info.pricing $prompt_n $pred_n $cache_n $currency)
 
     record_metric {
         source: "raw"
@@ -1643,11 +1648,11 @@ def "main raw" [
         prompt_tokens: $prompt_n
         completion_tokens: $pred_n
         cached_tokens: $cache_n
-        cost_usd: $cost_res.usd
-        cost_cfa: $cost_res.cfa
+        cost: $cost_res.amount
+        currency: $currency
     }
 
-    let cum_cost = (get_cumulative_cost)
+    let cum_cost = (get_cumulative_cost $currency)
     let cost_str = (format_cost_label $cost_res $cum_cost)
 
     let ctx_str = if $cache_n > 0 {
