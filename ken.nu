@@ -249,6 +249,9 @@ def get_slots_dir [model: string = ""] {
 }
 
 def tty_report [msg: string] {
+    if (($env.KEN_NO_TTY? | default "") in ["1", "true", "yes"]) or (($env.KEN_QUIET? | default "") in ["1", "true", "yes"]) {
+        return
+    }
     if ("/dev/tty" | path exists) {
         $msg | save --append "/dev/tty"
     } else {
@@ -883,7 +886,8 @@ def run_agent [
 ] {
     let parsed = (parse_spec $spec_str)
     let agent_name = $parsed.agent
-    let session_id = $parsed.session
+    let is_explicit_session = ($parsed.session != null)
+    let session_id = (if $is_explicit_session { $parsed.session } else { "0" })
 
     let agent_dir = (resolve_agent_dir $agent_name)
     if not ($agent_dir | path exists) {
@@ -959,11 +963,11 @@ def run_agent [
         }
     }
 
-    # Session loading
+    # Session loading: explicit session numbers continue; bare invocations clear session 0
     let session_dir = (get_session_dir)
     let session_file = ($session_dir | path join $"($agent_name)_($session_id).json")
     mut messages = []
-    if $session_id != null and ($session_file | path exists) {
+    if $is_explicit_session and ($session_file | path exists) {
         $messages = (try { open $session_file | get messages } catch { [] })
     }
 
@@ -1070,9 +1074,9 @@ def run_agent [
         if ($model_info.auth_header? | default null) != null {
             $curl_args = ($curl_args | append [-H $"Authorization: ($model_info.auth_header)"])
         }
-        $curl_args = ($curl_args | append [-d ($payload | to json -r)])
+        $curl_args = ($curl_args | append [-d "@-"])
 
-        for line in (^curl ...$curl_args | lines) {
+        for line in (($payload | to json -r) | ^curl ...$curl_args | lines) {
             let tr = ($line | str trim)
             if ($tr | is-empty) { continue }
             $stream_lines = ($stream_lines | append $tr)
@@ -1304,9 +1308,10 @@ def run_agent [
             $snapshot_restored = true
         }
 
-        # Save session history
+        # Save session history (auto session 0 or explicit session)
         if $session_id != null {
             try {
+                mkdir $session_dir
                 {
                     agent: $agent_name
                     session_id: $session_id
@@ -1321,7 +1326,8 @@ def run_agent [
         break
     }
 
-    if not (is-terminal --stdout) {
+    let no_tty = (($env.KEN_NO_TTY? | default "") in ["1", "true", "yes"]) or (($env.KEN_QUIET? | default "") in ["1", "true", "yes"])
+    if (not (is-terminal --stdout)) or $no_tty {
         print -n $final_response
     }
 
@@ -1576,11 +1582,13 @@ def "main prefill" [
     }
 }
 
-# Subcommand: raw (Direct completion against any configured model without tools or session overhead)
+# Subcommand: raw (Direct completion against any configured model without tools overhead)
 def "main raw" [
     prompt?: string              # Prompt text (or pipe via stdin)
     --model (-m): string = ""    # Model alias (defaults to default_model in config)
+    --session (-S): string = ""  # Session ID: if omitted, auto-clears & saves to session 0; if given, continues session
     --system (-s): string = ""   # Optional system instructions
+    --image (-i): string = ""    # Path to image file for multimodal models
     --max-tokens: int = 1024     # Max output tokens
     --temp: float = 0.1          # Sampling temperature
     --think (-t): string = ""    # Reasoning control: off, low, medium, high, on
@@ -1588,7 +1596,7 @@ def "main raw" [
     let has_stdin = (not (is-terminal --stdin))
     let piped_input = (if $has_stdin { try { open --raw /dev/stdin } catch { "" } } else { "" })
     let full_prompt = (if not ($prompt | default "" | is-empty) and not ($piped_input | is-empty) {
-        $"($prompt)\n\n($piped_input)"
+        $"($piped_input)\n\n($prompt)"
     } else if not ($prompt | default "" | is-empty) {
         $prompt
     } else {
@@ -1599,6 +1607,11 @@ def "main raw" [
         print -e "Error: No prompt provided for raw completion."
         return
     }
+
+    let is_explicit_session = not ($session | is-empty)
+    let session_id = (if $is_explicit_session { $session } else { "0" })
+    let session_dir = (get_session_dir)
+    let session_file = ($session_dir | path join $"raw_($session_id).json")
 
     load_ken_env
     let root_conf = (load_root_config)
@@ -1629,10 +1642,24 @@ def "main raw" [
     load-env { KEN_METRICS_FILE: $metrics_file }
 
     mut messages = []
-    if not ($system | is-empty) {
-        $messages = ($messages | append { role: "system", content: $system })
+    if $is_explicit_session and ($session_file | path exists) {
+        $messages = (try { open $session_file | get messages } catch { [] })
     }
-    $messages = ($messages | append { role: "user", content: $full_prompt })
+
+    if ($messages | is-empty) {
+        if not ($system | is-empty) {
+            $messages = [{ role: "system", content: $system }]
+        }
+    }
+    mut user_content: any = $full_prompt
+    if not ($image | is-empty) and ($image | path exists) {
+        let b64 = (open --raw $image | encode base64)
+        $user_content = [
+            { type: "text", text: $full_prompt }
+            { type: "image_url", image_url: { url: $"data:image/jpeg;base64,($b64)" } }
+        ]
+    }
+    $messages = ($messages | append { role: "user", content: $user_content })
 
     mut payload = {
         model: $model_info.model_name
@@ -1658,7 +1685,7 @@ def "main raw" [
     if ($model_info.auth_header? | default "" | is-not-empty) {
         $curl_args = ($curl_args | append [-H $"Authorization: ($model_info.auth_header)"])
     }
-    $curl_args = ($curl_args | append [-d ($payload | to json -r)])
+    $curl_args = ($curl_args | append [-d "@-"])
 
     mut full_content = ""
     mut full_reasoning = ""
@@ -1668,7 +1695,7 @@ def "main raw" [
     mut raw_usage: any = null
     mut stream_lines = []
 
-    for line in (^curl ...$curl_args | lines) {
+    for line in (($payload | to json -r) | ^curl ...$curl_args | lines) {
         let tr = ($line | str trim)
         if ($tr | is-empty) { continue }
         $stream_lines = ($stream_lines | append $tr)
@@ -1792,8 +1819,23 @@ def "main raw" [
     let raw_line = ($raw_parts | str join " | ")
     tty_report $"\n($indent)] raw.($model) | (ansi d)($raw_line)(ansi reset)\n"
 
-    if not (is-terminal --stdout) {
+    let no_tty = (($env.KEN_NO_TTY? | default "") in ["1", "true", "yes"]) or (($env.KEN_QUIET? | default "") in ["1", "true", "yes"])
+    if (not (is-terminal --stdout)) or $no_tty {
         print -n $full_content
+    }
+
+    # Save session history (auto session 0 or explicit session)
+    if not ($full_content | is-empty) {
+        $messages = ($messages | append { role: "assistant", content: $full_content })
+        try {
+            mkdir $session_dir
+            {
+                agent: "raw"
+                session_id: $session_id
+                updated_at: (date now | format date "%Y-%m-%d %H:%M:%S")
+                messages: $messages
+            } | to json -r | save -f $session_file
+        }
     }
 }
 
@@ -1824,48 +1866,186 @@ def "main call-agent" [
 }
 
 # Subcommand: session (Manage persistent chat sessions)
-def "main session" [
-    action: string = "list"
-    target: string = "all"
+def "main session" [] {
+    print "Ken Session Manager"
+    print "Usage: ken session <subcommand>\n"
+    print "Subcommands:"
+    print "  ken session list               List active sessions"
+    print "  ken session show [id]          Display session messages (default: 0)"
+    print "  ken session rename [src] <dst> Commit/rename session (src defaults to 0)"
+    print "  ken session set [src] <dst>    Alias for rename"
+    print "  ken session renumber [src] <dst> Alias for rename"
+    print "  ken session clear [id|all]     Clear session history (default: all)"
+    print "  ken session new [id]           Reset session context (default: 0)"
+    print "\nTip: Bare 'ken' calls auto-save to session 0. Run 'ken session rename <name>' to commit/save."
+}
+
+# Subcommand: session list (List all active persistent sessions)
+def "main session list" [] {
+    let s_dir = (get_session_dir)
+    let paths = (glob ($s_dir | path join "*.json"))
+    if ($paths | is-empty) {
+        print "No active sessions found."
+        return
+    }
+    let rows = ($paths | each { |p|
+        let data = (try { open $p } catch { null })
+        let sess_id = ($data.session_id? | default ($p | path parse | get stem))
+        let agent = ($data.agent? | default "unknown")
+        let count = ($data.messages? | default [] | length)
+        let updated = ($data.updated_at? | default "unknown")
+        let sz = (try { (ls $p | get 0.size | into int) / 1024 | math round --precision 1 } catch { 0 })
+        {
+            session: $sess_id
+            agent: $agent
+            messages: $count
+            size: $"($sz) KB"
+            updated_at: $updated
+        }
+    })
+    $rows | sort-by updated_at -r
+}
+
+# Subcommand: session show (Inspect messages inside a session)
+def "main session show" [
+    target: string = "0"          # Session ID or name (default: 0)
 ] {
     let s_dir = (get_session_dir)
-    match $action {
-        "list" => {
-            let files = (ls ($s_dir | path join "*.json") | default [])
-            if ($files | is-empty) {
-                print "No active sessions found."
-                return
+    let matched_files = (glob ($s_dir | path join $"*($target).json"))
+    let match_f = if not ($matched_files | is-empty) {
+        $matched_files | first
+    } else {
+        glob ($s_dir | path join $"*($target)*.json") | first
+    }
+
+    if $match_f == null {
+        print -e $"Error: Session '($target)' not found in ($s_dir)"
+        return
+    }
+
+    let data = (open $match_f)
+    print $"(ansi cyan_bold)=== Session: ($data.session_id? | default $target) [($data.agent? | default 'unknown')] ===(ansi reset)"
+    print $"(ansi dark_gray)File: ($match_f) | Last updated: ($data.updated_at? | default 'unknown')(ansi reset)\n"
+
+    for msg in ($data.messages? | default []) {
+        let role = $msg.role
+        let content = (if ($msg.content | describe) =~ "string" {
+            $msg.content
+        } else {
+            $msg.content | to json
+        })
+        match $role {
+            "system" => {
+                let first_line = ($content | lines | first | default "")
+                print $"(ansi dark_gray)[system]: ($first_line)...(ansi reset)\n"
             }
-            print "Active Sessions:"
-            for f in $files {
-                let data = (try { open $f.name } catch { null })
-                let count = ($data.messages? | default [] | length)
-                let updated = ($data.updated_at? | default "unknown")
-                let stem = ($f.name | path parse | get stem)
-                print $"- ($stem): ($count) messages | last: ($updated)"
+            "user" => {
+                print $"(ansi green_bold)[user]:(ansi reset)\n($content)\n"
             }
-        }
-        "clear" | "rm" => {
-            if $target == "all" {
-                rm -f ($s_dir | path join "*.json")
-                print "All sessions cleared."
-            } else {
-                rm -f ($s_dir | path join $"*($target)*.json")
-                print $"Cleared session: ($target)"
+            "assistant" => {
+                print $"(ansi yellow_bold)[assistant]:(ansi reset)\n($content)\n"
             }
-        }
-        "show" => {
-            let match_f = (glob ($s_dir | path join $"*($target)*.json") | first)
-            if $match_f != null {
-                open $match_f | to json
-            } else {
-                print $"Session '($target)' not found."
+            _ => {
+                print $"(ansi magenta_bold)[($role)]:(ansi reset)\n($content)\n"
             }
-        }
-        _ => {
-            print "Usage: ken session [list|clear|show] [id]"
         }
     }
+}
+
+# Subcommand: session clear (Clear session history)
+def "main session clear" [
+    target: string = "all"        # Session ID to clear or 'all'
+] {
+    let s_dir = (get_session_dir)
+    if $target in ["all" "*"] {
+        rm -f ($s_dir | path join "*.json")
+        print "✓ All sessions cleared."
+    } else {
+        let matched = (glob ($s_dir | path join $"*($target)*.json"))
+        if ($matched | is-empty) {
+            print $"No session found matching '($target)'."
+        } else {
+            for f in $matched {
+                rm -f $f
+                print $"✓ Cleared session file: ($f | path basename)"
+            }
+        }
+    }
+}
+
+# Subcommand: session rm (Alias for session clear)
+def "main session rm" [target: string = "0"] {
+    main session clear $target
+}
+
+# Subcommand: session rename (Rename or commit a session; source defaults to 0)
+def "main session rename" [
+    arg1?: string                 # If only one arg: destination name (source=0). If two: source
+    arg2?: string                 # Destination name when source is specified
+] {
+    let s_dir = (get_session_dir)
+    let src = if ($arg2 | default "" | is-not-empty) { $arg1 } else { "0" }
+    let dst = if ($arg2 | default "" | is-not-empty) { $arg2 } else { $arg1 }
+
+    if ($dst | default "" | is-empty) {
+        print -e "Error: Missing destination session name.\nUsage: ken session rename [source=0] <destination>"
+        return
+    }
+
+    # Find matching session files for source
+    let matched_files = (glob ($s_dir | path join $"*($src).json"))
+    if ($matched_files | is-empty) {
+        print -e $"Error: No active session found matching '($src)' in ($s_dir)"
+        return
+    }
+
+    for f in $matched_files {
+        let old_name = ($f | path basename)
+        let new_name = if ($old_name | str ends-with $"_($src).json") {
+            ($old_name | str replace -r $"_($src)\\.json$" $"_($dst).json")
+        } else if ($old_name == $"($src).json") {
+            $"($dst).json"
+        } else {
+            $"($old_name | path parse | get stem)_($dst).json"
+        }
+        let new_path = ($s_dir | path join $new_name)
+
+        try {
+            let content = (open $f | upsert session_id $dst | upsert updated_at (date now | format date "%Y-%m-%d %H:%M:%S"))
+            $content | to json -r | save -f $new_path
+            if ($f != $new_path) {
+                rm -f $f
+            }
+            print $"✓ Session '($src)' committed/renamed to '($dst)' -> ($new_name)"
+        } catch { |e|
+            print -e $"Failed to rename ($f): ($e.msg)"
+        }
+    }
+}
+
+# Subcommand: session set (Alias for session rename)
+def "main session set" [arg1?: string, arg2?: string] {
+    main session rename $arg1 $arg2
+}
+
+# Subcommand: session renumber (Alias for session rename)
+def "main session renumber" [arg1?: string, arg2?: string] {
+    main session rename $arg1 $arg2
+}
+
+# Subcommand: session mv (Alias for session rename)
+def "main session mv" [arg1?: string, arg2?: string] {
+    main session rename $arg1 $arg2
+}
+
+# Subcommand: session new (Start or reset a session)
+def "main session new" [id: string = "0"] {
+    let s_dir = (get_session_dir)
+    let matched = (glob ($s_dir | path join $"*($id).json"))
+    for f in $matched {
+        rm -f $f
+    }
+    print $"✓ Session '($id)' reset. Next invocation will start fresh."
 }
 
 # Subcommand: setup (Generate shell configuration snippet)
@@ -1912,8 +2092,10 @@ def "main setup" [
                 '            local prompt="${input_text#*#}"'
                 '            zle -I'
                 '            local gen_cmd'
-                '            gen_cmd=$(ken cmd.q "GENERATE: $prompt" 2>/dev/null)'
+                '            gen_cmd=$(KEN_NO_TTY=1 ken cmd "GENERATE: $prompt" 2>/dev/null)'
                 '            if [[ -n "$gen_cmd" ]]; then'
+                '                gen_cmd="${gen_cmd%"${gen_cmd##*[![:space:]]}"}"'
+                '                [[ -n "$gen_cmd" && "$gen_cmd" != *\; ]] && gen_cmd="${gen_cmd};"'
                 '                BUFFER="$gen_cmd"'
                 '                CURSOR=${#BUFFER}'
                 '            else'
@@ -1927,8 +2109,10 @@ def "main setup" [
                 '            local instruction="${input_text#*#}"'
                 '            zle -I'
                 '            local gen_cmd'
-                '            gen_cmd=$(ken cmd.q "MODIFY: Base command: '\''${base_cmd%% }'\'' | Instruction: '\''${instruction## }'\''" 2>/dev/null)'
+                '            gen_cmd=$(KEN_NO_TTY=1 ken cmd "MODIFY: Base command: '\''${base_cmd%% }'\'' | Instruction: '\''${instruction## }'\''" 2>/dev/null)'
                 '            if [[ -n "$gen_cmd" ]]; then'
+                '                gen_cmd="${gen_cmd%"${gen_cmd##*[![:space:]]}"}"'
+                '                [[ -n "$gen_cmd" && "$gen_cmd" != *\; ]] && gen_cmd="${gen_cmd};"'
                 '                BUFFER="$gen_cmd"'
                 '                CURSOR=${#BUFFER}'
                 '            else'
@@ -1936,10 +2120,17 @@ def "main setup" [
                 '            fi'
                 '            zle reset-prompt'
                 ''
-                "        # 3. Ends with ';' -> Explain command in detail"
+                "        # 3. Ends with ';' -> Explain command in detail (replace in-place with # comments)"
                 "        elif [[ \"$input_text\" =~ ';[[:space:]]*$' ]]; then"
                 '            zle -I'
-                '            ken cmd.q "EXPLAIN: $input_text"'
+                '            local explanation'
+                '            explanation=$(KEN_NO_TTY=1 ken cmd "EXPLAIN: $input_text" 2>/dev/null)'
+                '            if [[ -n "$explanation" ]]; then'
+                '                BUFFER="$(echo "$explanation" | sed "s/^/# /")"'
+                '                CURSOR=${#BUFFER}'
+                '            else'
+                "                printf '\\a'"
+                '            fi'
                 '            zle reset-prompt'
                 ''
                 '        # 4. Neither format matches -> Bell / do nothing'
@@ -1999,26 +2190,46 @@ def main [
         print "  ken prefill [agent]       Pre-evaluate & save prompt snapshots"
         print "  ken tok [patterns...]     Count tokens via llama.cpp"
         print "  ken schema [agent]        Dump OpenAI tools schema"
-        print "  ken session [list|clear]  Manage persistent sessions"
+        print "  ken session [list|show|rename|clear] Manage persistent sessions"
         print "\nOptions:"
         print "  -t, --think <level>       Reasoning control: off, low, medium, high, on"
         print "  -i, --image <path>        Pass image for multimodal models"
         print "      --slot <id>           Force llama-server KV slot ID"
         print "      --no-md               Disable telemetry header/footer banners"
         print "\nExamples:"
-        print "  ken 1qwent 'Solve step by step'"
-        print "  ken -t off q 'Give me 3 bullet points'"
+        print "  ken 'Solve step by step'         # Auto-saves to session 0"
+        print "  ken 0 'Explain further'          # Continues session 0"
+        print "  ken session rename math_step     # Commits session 0 to 'math_step'"
+        print "  ken 1qwent 'Solve step by step'  # Continues or creates session 1 on qwent"
         print "  ken notes.lfm 'What is a PCB?'"
         print "  ken tok '~/Documents/notes/**/*.typ'"
         print "  . <(ken setup $SHELL ~/.config/ken)"
         return
     }
 
-    # Handle piped stdin if query is empty
-    let full_query = (if not ($query | is-empty) and not ($piped_input | is-empty) {
-        $"($query)\n\n($piped_input)"
-    } else if not ($query | is-empty) {
-        $query
+    mut actual_spec = ($spec | default "")
+    mut actual_query = ($query | default "")
+
+    # If only one positional argument was passed without piped input:
+    if ($actual_query | is-empty) and ($piped_input | is-empty) and not ($actual_spec | is-empty) {
+        let root_conf = (load_root_config)
+        let ken_root = (get_ken_root)
+        let has_session_digit = ($actual_spec | parse -r '^(?<session>\d+)(?<rest>.*)$' | get 0.session? | default "" | is-not-empty)
+        let is_model_alias = ($actual_spec in ($root_conf.models | columns))
+        let is_agent_dir = (($ken_root | path join $actual_spec | path exists) and ($ken_root | path join $actual_spec | path type) == "dir")
+        let is_dotted = ($actual_spec | str contains ".")
+
+        if not ($has_session_digit or $is_model_alias or $is_agent_dir or $is_dotted) {
+            $actual_query = $actual_spec
+            $actual_spec = ""
+        }
+    }
+
+    # Handle piped stdin (piped data precedes query for optimal prefix KV caching)
+    let full_query = (if not ($actual_query | is-empty) and not ($piped_input | is-empty) {
+        $"($piped_input)\n\n($actual_query)"
+    } else if not ($actual_query | is-empty) {
+        $actual_query
     } else {
         $piped_input
     })
@@ -2028,5 +2239,5 @@ def main [
         return
     }
 
-    run_agent $spec $full_query $image $slot $no_md $think
+    run_agent $actual_spec $full_query $image $slot $no_md $think
 }
