@@ -60,12 +60,12 @@ def load_root_config [] {
     let merged = if ($conf_path | path exists) { $base_conf | merge (open $conf_path) } else { $base_conf }
     let with_agent = if ($merged.default_agent | is-empty) {
         let agents = (list_agent_dirs $ken_root | get name | each { path basename })
-        $merged | upsert default_agent ($agents | first | default "orchestrator")
+        $merged | upsert default_agent ($agents | first | default "")
     } else {
         $merged
     }
     if ($with_agent.default_model | is-empty) {
-        let first_m = ($with_agent.providers | values | get -o 0.models | default {} | columns | first | default "g")
+        let first_m = ($with_agent.providers | values | get -o 0.models | default {} | columns | first | default "")
         $with_agent | upsert default_model $first_m
     } else {
         $with_agent
@@ -279,7 +279,7 @@ def resolve_agent_dir [agent: string] {
 
 def parse_spec [spec_str: string] {
     let raw = ($spec_str | default "" | str trim)
-    let def_agent = ((load_root_config).default_agent? | default "orchestrator")
+    let def_agent = ((load_root_config).default_agent? | default "")
     if ($raw | is-empty) {
         { session: null, agent: $def_agent, model: null, model_explicit: false }
     } else {
@@ -391,9 +391,10 @@ def do_call_agent [agent: string, task: string, model: string = "", caller_agent
             let supported_models = ($target_conf.supported_models? | default [])
             let target_default = ($target_conf.default_model? | default "")
             let caller_model = ($env.KEN_MODEL? | default "")
+            let caller_is_local = (resolve_model_info $caller_model $root_conf).is_local
             let chosen_model = if not ($model | is-empty) {
                 $model
-            } else if ($caller_model | str starts-with "a") {
+            } else if (not ($caller_model | is-empty)) and (not $caller_is_local) {
                 $caller_model
             } else if (not ($caller_model | is-empty)) and (($supported_models | is-empty) or ($caller_model in $supported_models)) {
                 $caller_model
@@ -1084,7 +1085,7 @@ def "main schema" [agent?: string] {
 
 # Delegate a task to a specialized domain agent
 def "main call_agent" [
-    --agent (-a): string          # Target agent (e.g. coder, task, plan, fs, sys, mail)
+    --agent (-a): string          # Target agent name
     --task (-t): string           # The specific prompt or task for the agent
     --model (-m): string = ""     # Optional model override
 ] {
