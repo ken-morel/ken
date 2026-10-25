@@ -11,7 +11,10 @@ def stdout []: nothing -> bool {
 }
 
 def tty_report [msg: string] {
-    if (tty) { $msg | save --append /dev/tty }
+    if (tty) {
+        let out = ($env.KEN_TTY_OUT? | default "/dev/tty")
+        $msg | save --append $out
+    }
 }
 
 def get_ken_root [] {
