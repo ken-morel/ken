@@ -408,7 +408,11 @@ def do_call_agent [agent: string, task: string, model: string = "", caller_agent
             let sess_id = ($env.KEN_SESSION? | default "0")
             let full_spec = if $sess_id != "0" and $sess_id != "default" { $"($sess_id)($target)" } else { $target }
             let ken_nu = ($env.CURRENT_FILE? | default ($ken_root | path join "ken.nu"))
-            let res = (with-env { KEN_DEPTH: (($depth + 1) | into string), KEN_TTY: ((tty) | into int | into string) } {
+            let res = (with-env {
+                KEN_DEPTH: (($depth + 1) | into string)
+                KEN_TTY: ((tty) | into int | into string)
+                KEN_TTY_OUT: ($env.KEN_TTY_OUT? | default "/dev/tty")
+            } {
                 if ($ken_nu | path exists) { ^$ken_nu $full_spec $task | complete } else { ^ken $full_spec $task | complete }
             })
             if $res.exit_code == 0 { $res.stdout } else { $"Error running agent ($agent): ($res.stderr)\n($res.stdout)" }
